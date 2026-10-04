@@ -199,6 +199,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, app.wechat_view(probe=query.get('probe', ['0'])[0] == '1'))
             if path == '/api/wechat/contacts':
                 return self.respond(200, app.channels.contacts(query.get('q', [''])[0]))
+            if path == '/api/wechat/avatar':
+                return self.respond(200, app.channels.wechat.avatar())
             if path == '/api/config':
                 return self.respond(200, app.config_view())
             if path == '/api/token':

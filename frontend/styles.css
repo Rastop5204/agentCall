@@ -2767,6 +2767,7 @@ dialog[open] {
 .wechat-login-layout { display: grid; grid-template-columns: 176px minmax(0, 1fr); gap: 23px; align-items: center; margin: 25px 0; }
 .wechat-qr { aspect-ratio: 1; border: 1px solid var(--line); border-radius: 9px; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 12px; background: var(--surface-soft); }
 .wechat-qr img { width: 100%; height: 100%; object-fit: contain; background: #fff; }
+.wechat-qr img.wechat-avatar { object-fit: cover; border-radius: 6px; background: var(--surface); }
 .qr-placeholder { display: flex; flex-direction: column; align-items: center; gap: 13px; text-align: center; color: var(--muted); font-size: 10px; }
 .qr-placeholder svg { width: 48px; height: 48px; stroke-width: 1.3; color: var(--line-strong); }
 .qr-placeholder.connected svg { color: var(--accent); }

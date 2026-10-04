@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends chromium ca-cer
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-COPY --chown=agentcall:agentcall service.cjs bridge-compat.cjs ./
+COPY --chown=agentcall:agentcall service.cjs bridge-compat.cjs uos-compat.cjs LICENSE.wechaty ./
 USER agentcall
 WORKDIR /data
 HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \

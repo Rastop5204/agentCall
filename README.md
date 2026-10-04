@@ -10,7 +10,7 @@
 
 若微信发送已经开始但结果不确定，服务会保存「发送结果未知」，避免重复补发邮件。已经发出的等待请求留在原通道，不因之后离线而重复通知。微信只有一个待答问题时可直接回复；多个问题同时等待时，请在回复中保留相应的 `[AC:请求编号]`。回复仅接受发送时绑定的微信账号和目标联系人；旧账号、其他联系人、群聊或歧义回复不会作为决策。超时后带编号的回复继续归档，不会重新激活已超时请求。
 
-**登录条件**：使用 [python-wechaty](https://github.com/wechaty/python-wechaty) 和配套的 `wechaty-puppet-wechat` Web 微信服务。Python SDK 本身不提供独立的微信登录协议，因此 Docker 内包含 Node.js/Chromium 服务。部分微信账号不具备 Web 微信登录资格；即使能显示二维码，也可能在扫码后被微信拒绝，此时邮箱继续可用。高级设置可接入已有的兼容 Puppet Service（外部连接要求受信任 TLS）。详见 [微信接入说明](docs/wechat.md)。
+**登录条件**：使用 [python-wechaty](https://github.com/wechaty/python-wechaty) 和配套的 `wechaty-puppet-wechat` 服务。Python SDK 本身不提供独立的微信登录协议，因此 Docker 内包含 Node.js/Chromium 服务。本地服务启用 UOS 兼容登录，并移植官方 1.18.4 的 UOS 参数；普通网页版失败不代表 UOS 一定不可用。微信仍可能拒绝具体账号或登录环境，此时邮箱继续可用。高级设置可接入已有的兼容 Puppet Service（外部连接要求受信任 TLS）。详见 [微信接入说明](docs/wechat.md)。
 
 ## 从 EmailCall 升级
 

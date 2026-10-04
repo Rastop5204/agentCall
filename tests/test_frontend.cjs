@@ -116,6 +116,28 @@ async function testWechatConfiguration() {
  assert.equal(h.get('wechatFormData().target_contact_id'),'');
  assert.equal(h.get('state.wechatDirty'),true);
 }
+async function testWechatAvatar() {
+ const h=harness(); let finish;
+ h.context.handler=()=>new Promise(resolve=>{finish=resolve;});
+ h.get('api=handler; renderWechatStatus({logged_in:true,account:{id:"own",name:"Account <b>"}})');
+ assert.match(h.elements.get('#wechat-qr').innerHTML,/微信已登录/);
+ finish({account_id:'own',image:'data:image/jpeg;base64,/9j/AAAA'});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.match(h.elements.get('#wechat-qr').innerHTML,/class="wechat-avatar"/);
+ assert.match(h.elements.get('#wechat-qr').innerHTML,/Account &lt;b&gt;的头像/);
+ h.get('renderWechatStatus({logged_in:false,state:"logged_out"})');
+ assert.doesNotMatch(h.elements.get('#wechat-qr').innerHTML,/wechat-avatar/);
+ h.get('renderWechatStatus({logged_in:true,account:{id:"second"}})');
+ h.get('renderWechatStatus({logged_in:false,state:"logged_out"})');
+ finish({account_id:'second',image:'data:image/jpeg;base64,/9j/AAAA'});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.doesNotMatch(h.elements.get('#wechat-qr').innerHTML,/wechat-avatar/);
+ h.get('renderWechatStatus({logged_in:true,account:{id:"third"}})');
+ finish({account_id:'third',image:'https://tracker.example/avatar.jpg'});
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.doesNotMatch(h.elements.get('#wechat-qr').innerHTML,/tracker|<img/);
+ assert.match(h.elements.get('#wechat-qr').innerHTML,/微信已登录/);
+}
 async function testWechatRequestAndRecords() {
  const h=harness();const calls=[];
  h.get('state.wechat={enabled:true,target_contact_id:"wxid_target"}; state.config=null');
@@ -169,6 +191,7 @@ async function testWechatConnectionDiagnosticsWithoutTarget() {
  assert.match(restored.get("waitingMessage(new Date(Date.now()-1000).toISOString())"),/最多 30 秒/);
  testIgnoredReplyDiagnostics();
  await testWechatConfiguration();
+ await testWechatAvatar();
  await testWechatRequestAndRecords();
  await testWechatConnectionDiagnosticsWithoutTarget();
  console.log('PASS: lost-response retry reuses key/payload across reload; success clears pending; 422 clears pending; changed saved config prevents resend; deadline reconciliation copy.');

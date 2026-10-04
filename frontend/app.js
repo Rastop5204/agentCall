@@ -190,6 +190,7 @@ const state = {
   contactSearchVersion: 0,
   wechatRefreshing: false,
   wechatSignature: "",
+  wechatAvatar: null,
   wechatConfigSignature: "",
 };
 const statusNames = {
@@ -620,7 +621,12 @@ function applyWechat(data, preserveEdits = true) {
 }
 function renderWechatStatus(status) {
   state.wechatStatus = status;
-  const signature = JSON.stringify([status.state, status.logged_in, status.available, status.account, status.qr_image, status.qr_status, status.error]);
+  const accountId = status.logged_in ? status.account?.id : null;
+  if (state.wechatAvatar?.accountId !== accountId) state.wechatAvatar = null;
+  if (accountId) void loadWechatAvatar(accountId);
+  const avatar = state.wechatAvatar?.image;
+  const safeAvatar = typeof avatar === "string" && avatar.length < 710000 && /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(avatar);
+  const signature = JSON.stringify([status.state, status.logged_in, status.available, status.account, status.qr_image, status.qr_status, status.error, avatar]);
   if (signature === state.wechatSignature) return;
   state.wechatSignature = signature;
   const labels = { disabled: "微信未启用", stopped: "微信已停止", starting: "正在启动微信连接", connecting: "正在连接微信服务", scanning: "等待扫码登录", scan: "等待扫码登录", waiting_scan: "等待扫码登录", awaiting_scan: "等待扫码登录", waiting_login: "等待扫码登录", logged_out: "微信当前未登录", error: "微信连接遇到问题", unavailable: "微信暂时不可用" };
@@ -635,7 +641,13 @@ function renderWechatStatus(status) {
   $(".status-dot", $("#wechat-status")).className = `status-dot ${loggedIn ? "online" : status.error ? "error" : ""}`;
   $("#wechat-error").hidden = !status.error;
   $("#wechat-error").innerHTML = status.error ? `<strong>${escapeHTML(status.error.message || "微信连接失败")}</strong>${status.error.hint ? `<p>${escapeHTML(status.error.hint)}</p>` : ""}${status.error.code ? `<code>${escapeHTML(status.error.code)}</code>` : ""}` : "";
-  $("#wechat-qr").innerHTML = loggedIn ? `<div class="qr-placeholder connected">${icon("check")}<span>微信已登录</span></div>` : safeImage ? `<img src="${escapeHTML(qr)}" alt="使用微信扫描此二维码并在手机上确认登录"/>` : `<div class="qr-placeholder">${icon("qr")}<span>${status.state === "starting" ? "正在获取登录二维码…" : "登录二维码会显示在这里"}</span></div>`;
+  $("#wechat-qr").innerHTML = loggedIn ? safeAvatar ? `<img class="wechat-avatar" src="${escapeHTML(avatar)}" alt="${escapeHTML(status.account?.name || "当前微信")}的头像"/>` : `<div class="qr-placeholder connected">${icon("check")}<span>微信已登录</span></div>` : safeImage ? `<img src="${escapeHTML(qr)}" alt="使用微信扫描此二维码并在手机上确认登录"/>` : `<div class="qr-placeholder">${icon("qr")}<span>${status.state === "starting" ? "正在获取登录二维码…" : "登录二维码会显示在这里"}</span></div>`;
+  if (loggedIn && safeAvatar) $("#wechat-qr .wechat-avatar").addEventListener("error", () => {
+    if (state.wechatAvatar?.image !== avatar) return;
+    state.wechatAvatar.image = null;
+    state.wechatAvatar.attemptAt = Date.now();
+    renderWechatStatus(state.wechatStatus);
+  }, { once: true });
   $("#wechat-login-title").textContent = loggedIn ? "连接已经建立" : safeImage ? "用微信扫一扫" : "从一次扫码开始";
   $("#wechat-login-help").textContent = loggedIn ? "登录会话保存在本机。断开并停用后，重新启用可恢复仍有效的会话；更换微信账号后需重新选择联系人。" : safeImage ? "请使用微信扫描二维码并在手机确认。二维码过期时，点击刷新二维码。" : "点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新选择目标联系人。";
   $("#wechat-login").hidden = loggedIn;
@@ -643,6 +655,20 @@ function renderWechatStatus(status) {
   $("#wechat-logout").hidden = !loggedIn;
   $("#wechat-load-contacts").disabled = !loggedIn;
   updateChannelLabels();
+}
+async function loadWechatAvatar(accountId) {
+  const cached = state.wechatAvatar;
+  if (cached?.accountId === accountId && (cached.pending || Date.now() - cached.attemptAt < (cached.image ? 3600000 : 60000))) return;
+  const entry = state.wechatAvatar = { accountId, image: cached?.image || null, pending: true, attemptAt: Date.now() };
+  try {
+    const result = await api("/api/wechat/avatar");
+    if (state.wechatAvatar !== entry || !state.wechatStatus?.logged_in || state.wechatStatus.account?.id !== accountId) return;
+    entry.image = result.account_id === accountId ? result.image : null;
+  } catch { /* The login indicator remains usable without an avatar. */ }
+  finally {
+    entry.pending = false;
+    if (state.wechatAvatar === entry && state.wechatStatus) renderWechatStatus(state.wechatStatus);
+  }
 }
 async function refreshWechat(probe = false) {
   if (state.wechatRefreshing) return;

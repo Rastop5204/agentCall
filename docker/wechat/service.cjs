@@ -10,6 +10,7 @@ const { MemoryCard } = require('memory-card');
 const { Bridge } = require('wechaty-puppet-wechat/dist/src/bridge.js');
 const { MEMORY_SLOT } = require('wechaty-puppet-wechat/dist/src/config.js');
 require('./bridge-compat.cjs').installBridgeCompatibility(Bridge, MEMORY_SLOT);
+require('./uos-compat.cjs').installUosCompatibility(Bridge);
 
 process.umask(0o077);
 

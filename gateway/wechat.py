@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import json
 import logging
 import os
 import re
@@ -154,6 +155,7 @@ class _SDKClient:
         self._stream_task = None
         self._accept_scan = not connection.get('reset_login')
         self._stale_qr = set()
+        self._avatar_cache = None
 
     async def run(self, callback):
         self._callback = callback
@@ -232,6 +234,28 @@ class _SDKClient:
             return {"id": account_id, "name": getattr(payload, "name", "") or ""}
         finally:
             self._dongs.pop(nonce, None)
+
+    async def avatar(self):
+        from gateway.avatar import avatar_image
+        account_id = self.puppet.login_user_id
+        if not account_id:
+            return {'account_id': None, 'image': None}
+        cached = self._avatar_cache
+        if cached and cached[0] == account_id and cached[1] > time.monotonic():
+            return {'account_id': account_id, 'image': cached[2]}
+        image = None
+        try:
+            # SDK FileBox.from_json drops the Cookie header; read the wire box
+            # directly, keeping its URL and credentials entirely server-side.
+            reply = await self.puppet.puppet_stub.contact_avatar(id=account_id)
+            box = json.loads(reply.filebox)
+            image = await asyncio.to_thread(avatar_image, box)
+        except Exception:
+            pass  # A missing avatar must not affect login or message routing.
+        if account_id != self.puppet.login_user_id:
+            return {'account_id': None, 'image': None}
+        self._avatar_cache = (account_id, time.monotonic() + (3600 if image else 60), image)
+        return {'account_id': account_id, 'image': image}
 
     async def contacts(self, query="", limit=100):
         ids = await self.puppet.contact_list()
@@ -470,7 +494,7 @@ class WechatGateway:
             code = str(payload.get('return_code', 'unknown'))
             code = code if re.fullmatch(r'-?\d{1,8}|unknown', code) else 'unknown'
             error = WechatError('WECHAT_LOGIN_REJECTED', '微信服务器拒绝了本次网页登录（返回码：' + code + '）。',
-                '手机扫码确认不代表网页登录成功。可先在官方微信网页版验证该账号是否允许登录；当前请求将使用邮箱备用。', True)
+                '手机扫码确认不代表登录成功。本地模式已启用 UOS 兼容登录；普通网页版的结果不能单独判断 UOS 是否可用。若刷新后仍被拒绝，请使用邮箱备用或兼容的其他 Puppet 服务。', True)
             self._set(state='error', logged_in=False, available=False, account=None,
                       qr_code=None, error=error.as_dict())
             self._report('login_failed', error)
@@ -536,6 +560,23 @@ class WechatGateway:
             detail = status.get("error") or {"code": "WECHAT_DISABLED", "message": "微信配置未启用。", "hint": "请启用并扫码登录。"}
             raise WechatError(detail["code"], detail["message"], detail.get("hint", ""), True)
         return status
+
+    async def _avatar(self):
+        client = self._client
+        if client is None:
+            return {'account_id': None, 'image': None}
+        result = await client.avatar()
+        if self._client is not client or not self.status().get('logged_in'):
+            return {'account_id': None, 'image': None}
+        return result
+
+    def avatar(self):
+        if not self.status().get('logged_in'):
+            return {'account_id': None, 'image': None}
+        try:
+            return self._call(self._avatar(), 8)
+        except Exception:
+            return {'account_id': None, 'image': None}
 
     async def _contacts(self, query, limit):
         if self._client is None:

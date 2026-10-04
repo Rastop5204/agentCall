@@ -70,3 +70,19 @@
 根因：刷新接口只重连 Python 客户端，未停止并重新启动远端 Puppet；服务会向新事件流回放缓存的 scanPayload，包括上次的 Scanned 状态。刷新现先执行远端 Stop，再订阅新事件流、调用 Start 重建登录页；订阅阶段回放的旧二维码被屏蔽。只有已展示为等待扫码的同一个二维码能进入 Scanned/Confirmed。登录拒绝保持可见直到显式新尝试，旧连接和旧运行代次的延迟事件不能覆盖新状态。
 
 真实 Docker 服务连续调用刷新接口两次，均清空旧图后生成不同的新二维码；两次均为 Waiting、logged_in=false，未扫描时不再出现 Scanned。137 项本机 Python 测试执行（1 项 SDK 集成由 Docker 承担），Docker 中 24 项真实 SDK/传输测试全部通过，包含 Stop→Event→Start 顺序和旧扫码事件回放。前端与 Node 三组测试通过。此次解决登录状态误报和无效刷新，不声称已解决微信 1203 拒绝或完成真实账号登录。
+
+## 官方 UOS 方案更新
+
+用户确认普通 wx.qq.com 也无法登录后，提供了 2021 年官方 UOS 文章。核对[文章源码](https://github.com/wechaty/jekyll/blob/main/jekyll/_posts/2021-04-13-wechaty-uos-web.md)及[2022 年后续说明](https://wechaty.js.org/2022/07/26/free-uos-ui/)发现，普通 Web 失败不能据此推断 UOS 失败。当前 0.28.1 实际已无条件注入旧版 UOS 参数；官方 #206／1.18.4 更换了公开 extspam 参数并调整入口地址。
+
+保留已验证的 Python／Node gRPC 版本，单独移植官方 1.18.4 UOS 参数及 `lang=zh_CN&target=t`；替换旧拦截器，避免重复处理请求。请求头仅作用于允许列表中的 HTTPS 微信登录端点，关闭页面引起的异常会被安全处理。日志仅记录使用的 UOS 版本，不包含二维码、登录票据、Cookie 或用户信息。界面错误提示不再建议用普通网页版失败判断 UOS 资格。
+
+Node／前端 6 组测试通过；Docker Python 3.10 内 24 项真实 SDK／传输测试通过；私有服务真实 gRPC 鉴权验证通过。旧失败会话已备份到微信数据卷 `wechat-session.memory-card.json.before-uos-*`，随后创建干净会话；邮箱数据库和凭据未改变。两容器更新后健康，真实 Chromium 已生成新二维码，API 为 Waiting、logged_in=false。随后用户扫码并确认，真实日志捕获新版 UOS 请求头应用标记，API 收到登录事件且 `logged_in=true`。用户选择目标联系人后，主动在线检查返回 `available=true`，联系人接口可读取并确认已选目标。此前 1203 拒绝在这次新版参数＋干净会话的测试中不再出现；无法单独区分两项改动各自的贡献。
+
+经用户授权，向选定联系人发送 `test --channel wechat`，实际渠道为微信，服务接受发送；5 分钟内未收到有效回复，记录 `242cd9bcc6f94a56aa95fdedd37b8ccd` 为 timed_out，不能宣称真实双向收发通过。
+
+## 登录头像
+
+登录后的二维码区域新增当前账号头像，获取失败保留登录提示。旧 Python FileBox 解码会丢失 Cookie，现从受认证 gRPC 读取头像描述，在服务器内验证固定微信域名和头像路径、强制 HTTPS、禁止重定向并限制图片大小；不把远端会话 URL 或 Cookie 返回前端。实际接口成功返回 79,898 字节 JPEG，账号匹配当前登录用户。网关重建后登录和目标联系人均恢复可用。
+
+141 项本机 Python 测试执行（1 项 SDK 集成在 Docker 单独验证）；Docker 24 项 SDK／传输测试通过，Node／前端 6 组通过。新增覆盖头像大小／类型／目标限制、凭据保留在服务端、缓存、退出／换号竞态及前端降级。当前会话没有 Chrome DevTools MCP 工具，头像已做真实接口与前端行为验证，未进行浏览器截图验收。
