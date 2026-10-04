@@ -81,6 +81,19 @@ class WechatGatewayTests(unittest.TestCase):
         self.assertFalse(status["logged_in"])
         self.assertNotIn("secret", str(status))
 
+    def test_login_rejection_remains_visible_after_failed_health_probes(self):
+        self.client.account = None
+        self.gateway._event('login_failed', {'return_code': '1203'})
+        self.gateway._event('error', {})
+        status = self.gateway.check()
+        self.assertFalse(status['logged_in'])
+        self.assertIsNone(status['qr_code'])
+        self.assertEqual(status['error']['code'], 'WECHAT_LOGIN_REJECTED')
+        self.assertIn('1203', status['error']['message'])
+        self.client.disconnected = True
+        self.assertEqual(self.gateway.check()['error']['code'], 'WECHAT_LOGIN_REJECTED')
+        self.assertTrue(any(e['type'] == 'login_failed' for e in self.events))
+
     def test_status_does_not_probe_network_and_does_not_expose_secrets(self):
         status = self.gateway.status()
         self.assertEqual(self.client.probes, 0)
@@ -214,6 +227,15 @@ class WechatConfigurationTests(unittest.TestCase):
 
 
 class WechatInboundTests(unittest.IsolatedAsyncioTestCase):
+    async def test_login_error_forwards_only_the_protocol_code(self):
+        client = object.__new__(_SDKClient)
+        captured = []
+        client._callback = lambda event, payload: captured.append((event, payload))
+        client._error_event(SimpleNamespace(data='secret-cookie AGENTCALL_LOGIN_REJECTED:1203'))
+        self.assertEqual(captured, [('login_failed', {'return_code': '1203'})])
+        client._error_event(SimpleNamespace(data='secret login URL'))
+        self.assertEqual(captured[-1], ('error', {}))
+
     async def test_only_direct_nonself_text_with_real_timestamp_is_forwarded(self):
         client = object.__new__(_SDKClient)
         client.puppet = SimpleNamespace(login_user_id="own-account")
@@ -381,6 +403,8 @@ class WechatSDKIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(qr["qr_status"], "Waiting")
             self.assertIn("fake-test-qr", qr["qr_code"])
             self.assertIsNone(await client.probe())
+            await service.event(proto.EventType.EVENT_TYPE_ERROR, {'data': 'AGENTCALL_LOGIN_REJECTED:1203'})
+            self.assertEqual(await received('login_failed'), {'return_code': '1203'})
             await service.event(proto.EventType.EVENT_TYPE_LOGIN, {"contactId": "sdk-account"})
             await received("login")
             self.assertEqual((await client.probe())["id"], "sdk-account")

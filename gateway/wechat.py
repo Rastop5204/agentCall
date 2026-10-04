@@ -11,6 +11,7 @@ import concurrent.futures
 import copy
 import logging
 import os
+import re
 import ssl
 import sys
 import threading
@@ -159,7 +160,7 @@ class _SDKClient:
         self.puppet.on("login", lambda payload: callback("login", {"id": payload.contact_id, "name": ""}))
         self.puppet.on("logout", lambda payload: callback("logout", {}))
         self.puppet.on("ready", lambda payload: callback("ready", {}))
-        self.puppet.on("error", lambda payload: callback("error", {}))
+        self.puppet.on("error", self._error_event)
         self.puppet.on("dong", self._dong)
         self.puppet.on("message", self._message)
         # AsyncIOEventEmitter sends asynchronous handler failures here.
@@ -187,6 +188,13 @@ class _SDKClient:
         future = self._dongs.get(payload.data)
         if future is not None and not future.done():
             future.set_result(None)
+
+    def _error_event(self, payload):
+        marker = re.search(r'AGENTCALL_LOGIN_REJECTED:(-?\d{1,8}|unknown)', str(getattr(payload, 'data', ''))[:16384])
+        if marker:
+            self._callback('login_failed', {'return_code': marker.group(1)})
+        else:
+            self._callback('error', {})
 
     async def probe(self):
         nonce = "agentcall-" + uuid.uuid4().hex
@@ -384,6 +392,9 @@ class WechatGateway:
                 raise
             except Exception as exc:
                 error = _error(exc)
+                previous = self.status().get('error') or {}
+                if previous.get('code') == 'WECHAT_LOGIN_REJECTED':
+                    error = WechatError(previous['code'], previous['message'], previous['hint'], True)
                 self._set(state="error", available=False, logged_in=False, account=None,
                           qr_code=None, error=error.as_dict())
                 self._report("connection_failed", error)
@@ -415,7 +426,17 @@ class WechatGateway:
             self._set(state="logged_out", logged_in=False, available=False, account=None, qr_code=None,
                       error=WechatError("WECHAT_NOT_LOGGED_IN", "微信已退出登录。", "请重新扫码登录；新请求将优先使用可用的邮箱。", True).as_dict())
             self._report("logged_out")
+        elif event == 'login_failed':
+            code = str(payload.get('return_code', 'unknown'))
+            code = code if re.fullmatch(r'-?\d{1,8}|unknown', code) else 'unknown'
+            error = WechatError('WECHAT_LOGIN_REJECTED', '微信服务器拒绝了本次网页登录（返回码：' + code + '）。',
+                '手机扫码确认不代表网页登录成功。可先在官方微信网页版验证该账号是否允许登录；当前请求将使用邮箱备用。', True)
+            self._set(state='error', logged_in=False, available=False, account=None,
+                      qr_code=None, error=error.as_dict())
+            self._report('login_failed', error)
         elif event in {"error", "receive_error"}:
+            if (self.status().get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
+                return
             error = WechatError("WECHAT_RECEIVE_FAILED", "微信消息接收出现异常。", "后台将重连；请检查微信状态及记录。", True)
             self._set(available=False, error=error.as_dict())
             self._report("receive_failed", error)
@@ -454,10 +475,16 @@ class WechatGateway:
                 self._set(state="logged_in", logged_in=True, available=True, account=account,
                           qr_code=None, error=None, last_checked_at=_now())
             else:
+                if (self.status().get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
+                    self._set(last_checked_at=_now())
+                    return self.status()
                 state = "awaiting_scan" if self.status().get("qr_code") else "logged_out"
                 self._set(state=state, logged_in=False, available=False, account=None, last_checked_at=_now(),
                           error=WechatError("WECHAT_NOT_LOGGED_IN", "微信尚未登录。", "请扫描二维码并在手机上确认登录。", True).as_dict())
         except Exception as exc:
+            if (self.status().get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
+                self._set(last_checked_at=_now())
+                return self.status()
             error = _error(exc)
             self._set(state="error", available=False, logged_in=False, account=None,
                       error=error.as_dict(), last_checked_at=_now())

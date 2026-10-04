@@ -626,6 +626,8 @@ function renderWechatStatus(status) {
   const labels = { disabled: "微信未启用", stopped: "微信已停止", starting: "正在启动微信连接", connecting: "正在连接微信服务", scanning: "等待扫码登录", scan: "等待扫码登录", waiting_scan: "等待扫码登录", awaiting_scan: "等待扫码登录", waiting_login: "等待扫码登录", logged_out: "微信当前未登录", error: "微信连接遇到问题", unavailable: "微信暂时不可用" };
   const loggedIn = Boolean(status.logged_in);
   $("#wechat-status-title").textContent = loggedIn ? `已登录${status.account?.name ? ` · ${status.account.name}` : ""}` : labels[status.state] || "微信尚未登录";
+  if (!loggedIn && !status.error && status.qr_status === "Scanned") $("#wechat-status-title").textContent = "已扫码，请在手机上确认登录";
+  if (!loggedIn && !status.error && status.qr_status === "Confirmed") $("#wechat-status-title").textContent = "手机已确认，正在完成网页登录";
   $("#wechat-status-description").textContent = status.available ? "微信当前可用，将优先用于下一次 Agent 消息。" : loggedIn ? "选择并保存一位目标联系人后，即可发送消息。" : "微信不可用时，Agent 会自动使用已配置的邮箱。";
   $(".status-dot", $("#wechat-status")).className = `status-dot ${loggedIn ? "online" : status.error ? "error" : ""}`;
   $("#wechat-error").hidden = !status.error;

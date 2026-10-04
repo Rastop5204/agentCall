@@ -31,3 +31,21 @@ test('login long polling does not prevent bridge initialization or cookie restor
   await bridge.reload();
   assert.ok(ready, 'QR watchdog refresh must use the same lifecycle boundary');
 });
+
+test('bridge recovery does not accumulate load handlers or race injections', async () => {
+  let injections = 0;
+  class Bridge extends EventEmitter {
+    start() { this.on('load', this.onLoad.bind(this)); }
+    async onLoad() { injections++; await Promise.resolve(); }
+    async testBlockedMessage() { return '登录失败。'; }
+    preHtmlToXml(text) { return text; }
+  }
+  installBridgeCompatibility(Bridge, 'session');
+  const bridge = new Bridge();
+  bridge.start(); bridge.start();
+  assert.equal(bridge.listenerCount('load'), 1);
+  const page = {};
+  await Promise.all([bridge.onLoad(page), bridge.onLoad(page)]);
+  assert.equal(injections, 1);
+  assert.equal(await bridge.testBlockedMessage('<error><ret>1203</ret><message>private</message></error>'), 'AGENTCALL_LOGIN_REJECTED:1203');
+});
