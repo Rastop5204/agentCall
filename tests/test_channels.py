@@ -263,6 +263,19 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(self.store.get(record['id'])['channel'], 'wechat')
         self.assertEqual(self.store.get(record['id'])['status'], 'waiting')
 
+    def test_waiting_email_does_not_block_wechat_setup(self):
+        record = self.create(channel='email')
+        self.app.send_once()
+        self.app.save_wechat_config({'target_contact_id': ''})
+        self.app.save_wechat_config({'target_contact_id': 'user-1'})
+        self.assertEqual(self.store.get(record['id'])['status'], 'waiting')
+
+    def test_waiting_wechat_still_protects_its_contact(self):
+        self.create()
+        self.app.send_once()
+        with self.assertRaises(APIError):
+            self.app.save_wechat_config({'target_contact_id': ''})
+
     def test_legacy_record_defaults_to_email_channel(self):
         record = self.create(channel='email')
         record.pop('channel', None)

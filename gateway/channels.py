@@ -107,7 +107,9 @@ class Channels:
         elif not config['target_contact_id']:
             config['account_id'], config['target_contact_name'] = '', ''
         with self.store.lock:
-            if self.store.has_active() and config != old:
+            active = self.store.db.execute("""SELECT 1 FROM records WHERE status IN ('queued','sending')
+                OR (status='waiting' AND json_extract(data,'$.channel')='wechat') LIMIT 1""").fetchone()
+            if active and config != old:
                 raise APIError('REQUESTS_ACTIVE', '仍有正在发送或等待回复的请求。', '请等待请求结束后再修改微信配置。', 409)
             self.store.set_setting('wechat_config', config)
         connection_changed = any(config[k] != old[k] for k in ('enabled', 'mode', 'service_endpoint', 'service_token'))

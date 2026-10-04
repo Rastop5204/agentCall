@@ -27,4 +27,7 @@ test('login long polling does not prevent bridge initialization or cookie restor
   bridge.on('load', value => { assert.equal(value, page); ready = true; });
   await bridge.initPage({ newPage: async () => page });
   assert.ok(ready);
+  ready = false;
+  await bridge.reload();
+  assert.ok(ready, 'QR watchdog refresh must use the same lifecycle boundary');
 });
