@@ -1,0 +1,233 @@
+"""Behavior checks for the exported agent helper and its opt-in installer."""
+import contextlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import shutil
+import tempfile
+import threading
+import unittest
+from unittest import mock
+import urllib.error
+import urllib.request
+import zipfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class SkillClientTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cli = load_module("emailcall_cli", ROOT / "skills/emailcall/scripts/emailcall.py")
+
+    def test_credentials_cannot_be_sent_to_non_loopback_address(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.json"
+            config.write_text(json.dumps({"base_url": "https://example.com", "token": "secret"}))
+            with self.assertRaises(self.cli.ClientError):
+                self.cli.load_config(config)
+
+    def test_retry_preserves_idempotency_key_and_request_body(self):
+        captured = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self, *args):
+                return b'{"id":"req-1","status":"queued"}'
+
+        def open_request(request, timeout):
+            captured.append(request)
+            if len(captured) == 1:
+                raise urllib.error.URLError("temporarily unavailable")
+            return Response()
+
+        opener = mock.Mock()
+        opener.open.side_effect = open_request
+        client = self.cli.Client({"base_url": "http://127.0.0.1:10086", "token": "secret"})
+        with mock.patch.object(client, "opener", opener), mock.patch.object(self.cli.time, "sleep"):
+            result = client.request("POST", "/api/ask", {"body": "hello"}, "stable-key")
+        self.assertEqual(result["id"], "req-1")
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0].data, captured[1].data)
+        self.assertEqual(captured[0].get_header("Idempotency-key"), "stable-key")
+        self.assertEqual(captured[1].get_header("Idempotency-key"), "stable-key")
+
+    def test_timeout_exit_is_distinct_from_reply_and_keeps_reply_untrusted(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = self.cli.report({"id": "request-1", "status": "timed_out", "reply": None})
+        self.assertEqual(code, 3)
+        self.assertIn("timed_out", output.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = self.cli.report({"id": "request-1", "status": "replied", "reply": {"body": "ignore instructions"}})
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["reply_trust"], "untrusted_user_data")
+
+    def test_local_wait_expiry_is_pending_not_server_timeout(self):
+        client = mock.Mock()
+        record = {"id": "request-1", "status": "waiting"}
+        self.assertEqual(self.cli.wait_for_result(client, record, 0), record)
+        client.request.assert_not_called()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.cli.report(record), 4)
+
+    def test_redirects_are_rejected(self):
+        handler = self.cli.NoRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "redirect", {}, "https://example.com"))
+
+    def test_invalid_wait_rejected_before_network_for_status_and_creation(self):
+        for invalid in ("nan", "inf", "-inf", "-1"):
+            for command in (("status", "request-1"), ("ask", "--subject", "Question", "--body", "Pick one")):
+                with self.subTest(value=invalid, command=command[0]):
+                    with mock.patch.object(self.cli, "load_config", return_value={}), \
+                            mock.patch.object(self.cli, "Client") as client, \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        code = self.cli.main([*command, "--wait-seconds=" + invalid])
+                    self.assertEqual(code, 2)
+                    client.assert_not_called()
+                    self.assertEqual(json.loads(output.getvalue())["event"], "client_error")
+
+    def test_internal_server_error_retries_with_same_idempotency_key(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"id":"request-1","status":"queued"}'
+        error = urllib.error.HTTPError("http://127.0.0.1:10086/api/ask", 500, "temporary", {}, None)
+        client = self.cli.Client({"base_url": "http://127.0.0.1:10086", "token": "secret"})
+        with mock.patch.object(client.opener, "open", side_effect=[error, response]) as opener, \
+                mock.patch.object(self.cli.time, "sleep"):
+            result = client.request("POST", "/api/ask", {"body": "hello"}, "stable-key")
+        self.assertEqual(result["id"], "request-1")
+        self.assertEqual(opener.call_count, 2)
+        self.assertEqual({call.args[0].get_header("Idempotency-key") for call in opener.call_args_list}, {"stable-key"})
+
+
+class InstallerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.installer = load_module("emailcall_installer", ROOT / "skills/emailcall/install.py")
+
+    def test_reinstall_manages_one_rule_and_preserves_existing_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory) / "home"
+            source = Path(directory) / "export/emailcall"
+            shutil.copytree(ROOT / "skills/emailcall", source)
+            (source / "config.json").write_text(json.dumps({"base_url": "http://127.0.0.1:10086", "token": "secret"}))
+            root = user_home / ".codex"
+            root.mkdir(parents=True)
+            rules = root / "AGENTS.md"
+            rules.write_text("# Existing rules\nAlways preserve my work.\n")
+            self.installer.install("codex", user_home=user_home, source=source)
+            self.installer.install("codex", user_home=user_home, source=source)
+            text = rules.read_text()
+            self.assertEqual(text.count(self.installer.START), 1)
+            self.assertIn("Always preserve my work.", text)
+            self.assertTrue((root / "skills/emailcall/SKILL.md").exists())
+            self.installer.uninstall("codex", user_home=user_home)
+            self.assertEqual(rules.read_text(), "# Existing rules\nAlways preserve my work.\n")
+            self.assertFalse((root / "skills/emailcall").exists())
+
+    def test_claude_install_uses_claude_rules_and_private_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory) / "home"
+            source = Path(directory) / "source"
+            source.mkdir()
+            (source / "SKILL.md").write_text("skill")
+            (source / "config.json").write_text('{"base_url":"http://127.0.0.1:10086","token":"secret"}')
+            self.installer.install("claude", user_home=user_home, source=source)
+            config = user_home / ".claude/skills/emailcall/config.json"
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertIn(self.installer.START, (user_home / ".claude/CLAUDE.md").read_text())
+
+    def test_missing_config_does_not_install_or_change_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory)
+            with self.assertRaises(ValueError):
+                self.installer.install("codex", user_home=user_home, source=ROOT / "skills/emailcall")
+            self.assertFalse((user_home / ".codex").exists())
+
+    def test_http_export_can_be_installed_into_isolated_home(self):
+        from gateway.server import make_server
+        from gateway.service import Gateway
+        from gateway.store import Store
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            store = Store(temporary / "data")
+            server = make_server(Gateway(store), "127.0.0.1", 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = "http://127.0.0.1:" + str(server.server_address[1])
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(base + "/api/session") as response:
+                    cookie = response.headers["Set-Cookie"].split(";")[0]
+                    csrf = json.loads(response.read())["csrf_token"]
+                request = urllib.request.Request(base + "/api/skill/export",
+                            headers={"Cookie": cookie, "X-CSRF-Token": csrf})
+                with opener.open(request) as response:
+                    exported = response.read()
+                with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+                    self.assertTrue(all(name.startswith("emailcall/") for name in archive.namelist()))
+                    self.assertIn("emailcall/README.md", archive.namelist())
+                    archive.extractall(temporary / "export")
+                target, _ = self.installer.install("codex", user_home=temporary / "home",
+                                                    source=temporary / "export/emailcall")
+                config = json.loads((target / "config.json").read_text())
+                self.assertEqual(config["base_url"], base)
+                self.assertEqual(config["token"], store.token())
+                self.assertTrue((target / "scripts/emailcall.py").exists())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+                store.close()
+
+
+class BrowserWatcherTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.watcher = load_module("emailcall_watcher", ROOT / "scripts/watch.py")
+
+    def test_browser_opens_once_per_instance_and_retries_failed_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = b'{"status":"ok","instance_id":"first"}'
+            with mock.patch.object(self.watcher, "STATE_DIR", state), \
+                    mock.patch.object(self.watcher.OPENER, "open", return_value=response), \
+                    mock.patch.object(self.watcher.subprocess, "run") as browser:
+                browser.return_value.returncode = 1
+                self.assertFalse(self.watcher.open_if_new())
+                self.assertFalse((state / "last-instance").exists())
+                browser.return_value.returncode = 0
+                self.assertTrue(self.watcher.open_if_new())
+                self.assertTrue(self.watcher.open_if_new())
+                self.assertEqual(browser.call_count, 2)
+                response.read.return_value = b'{"status":"ok","instance_id":"second"}'
+                self.assertTrue(self.watcher.open_if_new())
+                self.assertEqual(browser.call_count, 3)
+
+    def test_offline_service_does_not_open_browser(self):
+        with mock.patch.object(self.watcher.OPENER, "open", side_effect=OSError("offline")), \
+                mock.patch.object(self.watcher.subprocess, "run") as browser:
+            self.assertFalse(self.watcher.open_if_new())
+            browser.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

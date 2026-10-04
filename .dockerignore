@@ -1,0 +1,14 @@
+.git
+.DS_Store
+.venv
+data
+artifacts
+tests
+scripts
+*.command
+README.md
+docs
+**/__pycache__
+**/*.pyc
+**/config.json
+.env

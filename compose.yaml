@@ -1,0 +1,28 @@
+name: emailcall
+
+services:
+  emailcall:
+    build: .
+    container_name: emailcall
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:10086:10086"
+    volumes:
+      - emailcall-data:/data
+    environment:
+      EMAILCALL_HOST: "0.0.0.0"
+      EMAILCALL_PORT: "10086"
+      EMAILCALL_DATA_DIR: "/data"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stop_grace_period: 25s
+
+volumes:
+  emailcall-data:
+    name: emailcall-data

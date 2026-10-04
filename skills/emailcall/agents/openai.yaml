@@ -1,0 +1,6 @@
+interface:
+  display_name: "EmailCall 邮件助手"
+  short_description: "通过本机邮箱网关通知任务完成、询问决策并等待邮件回复"
+  default_prompt: "使用 $emailcall 发送一封连通性测试邮件，等待并复述我的回复。"
+policy:
+  allow_implicit_invocation: true
