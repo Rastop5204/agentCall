@@ -122,8 +122,12 @@ class Channels:
         from gateway.service import APIError
         if not self.config()['enabled']:
             raise APIError('WECHAT_DISABLED', '请先启用并保存微信配置。', status=409)
-        self.wechat.stop()
-        self.start()
+        with self.store.lock:
+            active = self.store.db.execute("""SELECT 1 FROM records WHERE status IN ('queued','sending')
+                OR (status='waiting' AND json_extract(data,'$.channel')='wechat') LIMIT 1""").fetchone()
+            if active:
+                raise APIError('REQUESTS_ACTIVE', '仍有微信请求正在发送或等待回复，请结束后再刷新二维码。', status=409)
+        self.wechat.start(self.config(), reset_login=True)
         return self.view()
 
     def logout(self):

@@ -94,6 +94,12 @@ async function testWechatConfiguration() {
  assert.doesNotMatch(h.elements.get('#wechat-qr').innerHTML,/<img|tracker/);
  h.get('renderWechatStatus({state:"scan",logged_in:false,qr_image:"data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="})');
  assert.match(h.elements.get('#wechat-qr').innerHTML,/<img src="data:image\/svg\+xml;base64,/);
+ h.get('renderWechatStatus({state:"awaiting_scan",logged_in:false,qr_status:"Scanned",qr_image:"data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="})');
+ assert.match(h.elements.get('#wechat-status-title').textContent,/已扫码/);
+ h.get('renderWechatStatus({state:"awaiting_scan",logged_in:false,qr_status:"Waiting",qr_image:"data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="})');
+ assert.equal(h.elements.get('#wechat-status-title').textContent,'等待扫码登录');
+ h.get('renderWechatStatus({state:"connecting",logged_in:false,qr_status:"Scanned",qr_image:null})');
+ assert.doesNotMatch(h.elements.get('#wechat-status-title').textContent,/已扫码/);
  h.get('renderWechatStatus({state:"error",logged_in:false,error:{message:"<script>bad</script>",hint:"Try <again>",code:"TEST"}})');
  assert.match(h.elements.get('#wechat-error').innerHTML,/&lt;script&gt;/);
  assert.doesNotMatch(h.elements.get('#wechat-error').innerHTML,/<script>/);

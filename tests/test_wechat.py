@@ -188,6 +188,35 @@ class WechatGatewayTests(unittest.TestCase):
         self.gateway._event("scan", {"qr_code": "cancelled", "qr_status": "Cancel"})
         self.assertIsNone(self.gateway.status()["qr_code"])
 
+    def test_cached_scanned_event_requires_the_current_waiting_qr(self):
+        self.gateway._event('logout', {})
+        self.gateway._event('scan', {'qr_code': 'old', 'qr_status': 'Scanned'})
+        self.assertIsNone(self.gateway.status()['qr_code'])
+        self.gateway._event('scan', {'qr_code': 'new', 'qr_status': 'Waiting'})
+        self.gateway._event('scan', {'qr_code': 'old', 'qr_status': 'Scanned'})
+        self.assertEqual(self.gateway.status()['qr_status'], 'Waiting')
+        self.gateway._event('scan', {'qr_code': 'new', 'qr_status': 'Scanned'})
+        self.assertEqual(self.gateway.status()['qr_status'], 'Scanned')
+        self.gateway._event('login_failed', {'return_code': '1203'})
+        self.gateway._event('scan', {'qr_code': 'old', 'qr_status': 'Waiting'})
+        self.assertEqual(self.gateway.status()['error']['code'], 'WECHAT_LOGIN_REJECTED')
+
+    def test_explicit_refresh_restarts_remote_and_ignores_previous_client_events(self):
+        old_callback = self.client.callback
+        replacement = FakeClient({})
+        connections = []
+        def factory(connection):
+            connections.append(connection.copy())
+            return replacement
+        self.gateway._factory = factory
+        self.gateway.start(self.config, reset_login=True)
+        self.assertTrue(replacement.started.wait(2))
+        self.gateway._event('scan', {'qr_code': 'new', 'qr_status': 'Waiting'})
+        old_callback('scan', {'qr_code': 'old', 'qr_status': 'Scanned'})
+        self.assertEqual(self.gateway.status()['qr_code'], 'new')
+        self.assertEqual(self.gateway.status()['qr_status'], 'Waiting')
+        self.assertTrue(connections[0]['reset_login'])
+
     def test_saved_target_change_does_not_restart_login_session(self):
         changed = dict(self.config, target_contact_id="friend-2")
         self.gateway.start(changed)
@@ -316,7 +345,7 @@ class WechatSDKIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             def __mapping__(self):
                 methods = {}
-                for name, cardinality in (("Start", Cardinality.UNARY_UNARY),
+                for name, cardinality in (("Start", Cardinality.UNARY_UNARY), ("Stop", Cardinality.UNARY_UNARY),
                     ("Event", Cardinality.UNARY_STREAM), ("Ding", Cardinality.UNARY_UNARY),
                     ("ContactList", Cardinality.UNARY_UNARY), ("ContactPayload", Cardinality.UNARY_UNARY),
                     ("MessageSendText", Cardinality.UNARY_UNARY), ("MessagePayload", Cardinality.UNARY_UNARY)):
@@ -326,6 +355,11 @@ class WechatSDKIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             async def event(self, kind, payload):
                 await self.queue.put(proto.EventResponse(type=kind, payload=json.dumps(payload)))
+
+            async def Stop(self, stream):
+                self.operations.append('Stop')
+                await stream.recv_message()
+                await stream.send_message(proto.StopResponse())
 
             async def Start(self, stream):
                 self.operations.append("Start")
@@ -339,6 +373,8 @@ class WechatSDKIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.operations.append("Event")
                 await stream.recv_message()
                 self.authorization.append(stream.metadata.get("authorization"))
+                await stream.send_message(proto.EventResponse(type=proto.EventType.EVENT_TYPE_SCAN,
+                    payload=json.dumps({'status': 3, 'qrcode': 'old-cached-scanned-qr'})))
                 await stream.send_message(proto.EventResponse(type=proto.EventType.EVENT_TYPE_HEARTBEAT,
                                                                payload='{"data":"ready"}'))
                 self.operations.append("heartbeat-sent")
@@ -381,7 +417,7 @@ class WechatSDKIntegrationTests(unittest.IsolatedAsyncioTestCase):
         cache = tempfile.TemporaryDirectory()
         self.addCleanup(cache.cleanup)
         client = _SDKClient({"host": "127.0.0.1", "port": port, "tls": False,
-                             "token": "fake-sdk-token", "cache_dir": cache.name})
+                             "token": "fake-sdk-token", "cache_dir": cache.name, 'reset_login': True})
         events = []
         run = asyncio.create_task(client.run(lambda name, payload: events.append((name, payload))))
 
@@ -402,6 +438,8 @@ class WechatSDKIntegrationTests(unittest.IsolatedAsyncioTestCase):
             qr = await received("scan")
             self.assertEqual(qr["qr_status"], "Waiting")
             self.assertIn("fake-test-qr", qr["qr_code"])
+            self.assertEqual(service.operations[:2], ['Stop', 'Event'])
+            self.assertFalse(any(p.get('qr_code') == 'old-cached-scanned-qr' for _, p in events))
             self.assertIsNone(await client.probe())
             await service.event(proto.EventType.EVENT_TYPE_ERROR, {'data': 'AGENTCALL_LOGIN_REJECTED:1203'})
             self.assertEqual(await received('login_failed'), {'return_code': '1203'})

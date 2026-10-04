@@ -17,7 +17,7 @@ class FakeWechat:
         self.account_id = 'bot-1'
         self.failure = None
 
-    def start(self, config):
+    def start(self, config, *, reset_login=False):
         pass
 
     def stop(self):

@@ -105,6 +105,7 @@ class _SDKClient:
     an unrelated HTTP listener and hides connection errors in unbounded retries.
     """
     def __init__(self, connection):
+        self._connection = connection
         if sys.version_info >= (3, 11):
             raise WechatError("WECHAT_RUNTIME_UNSUPPORTED", "当前 Python 版本不兼容微信 SDK。",
                               "请使用项目 Docker 启动器；镜像包含已验证的 Python 3.10 环境。", True)
@@ -151,12 +152,13 @@ class _SDKClient:
         self._dongs = {}
         self._callback = None
         self._stream_task = None
+        self._accept_scan = not connection.get('reset_login')
+        self._stale_qr = set()
 
     async def run(self, callback):
         self._callback = callback
         await self.bot.init_puppet()
-        self.puppet.on("scan", lambda payload: callback("scan", {
-            "qr_code": payload.qrcode, "qr_status": getattr(payload.status, "name", str(payload.status))}))
+        self.puppet.on("scan", self._scan_event)
         self.puppet.on("login", lambda payload: callback("login", {"id": payload.contact_id, "name": ""}))
         self.puppet.on("logout", lambda payload: callback("logout", {}))
         self.puppet.on("ready", lambda payload: callback("ready", {}))
@@ -166,6 +168,11 @@ class _SDKClient:
         # AsyncIOEventEmitter sends asynchronous handler failures here.
         self.puppet._event_stream.on("error", lambda *args: callback("error", {}))
         self.puppet._init_puppet()
+        if self._connection.get('reset_login'):
+            # Stop before subscribing: the server closes its current event stream
+            # on Stop. Start below then creates a genuinely new browser page.
+            await asyncio.wait_for(self.puppet.puppet_stub.stop(), OPERATION_TIMEOUT)
+            self._connection['reset_login'] = False
         ready = asyncio.Event()
         self.puppet.on("heartbeat", lambda payload: ready.set())
         # Subscribe before Start so an immediate QR/login event cannot be lost.
@@ -177,12 +184,23 @@ class _SDKClient:
             if self._stream_task.done():
                 await self._stream_task
                 raise ConnectionError("event stream ended")
+            self._accept_scan = True
             await asyncio.wait_for(self.puppet.puppet_stub.start(), OPERATION_TIMEOUT)
             await self._stream_task
         finally:
             ready_task.cancel()
             await asyncio.gather(ready_task, return_exceptions=True)
         raise ConnectionError("event stream ended")
+
+    def _scan_event(self, payload):
+        if not self._accept_scan:
+            if payload.qrcode:
+                self._stale_qr.add(payload.qrcode)
+            return
+        if payload.qrcode in self._stale_qr:
+            return
+        self._callback('scan', {'qr_code': payload.qrcode,
+            'qr_status': getattr(payload.status, 'name', str(payload.status))})
 
     def _dong(self, payload):
         future = self._dongs.get(payload.data)
@@ -309,6 +327,7 @@ class WechatGateway:
         self._client = None
         self._task = None
         self._stopping = False
+        self._generation = 0
         self._state = {"state": "disabled", "logged_in": False, "available": False,
                        "account": None, "qr_code": None, "qr_status": None,
                        "qr_updated_at": None, "error": None, "last_checked_at": None}
@@ -333,12 +352,12 @@ class WechatGateway:
         with self._lock:
             return copy.deepcopy(self._state)
 
-    def start(self, config):
+    def start(self, config, *, reset_login=False):
         with self._lifecycle:
             config = copy.deepcopy(config or {})
             keys = ("enabled", "mode", "service_endpoint", "service_token")
             same = all(config.get(key) == self._config.get(key) for key in keys)
-            if same and self._thread and self._thread.is_alive():
+            if same and not reset_login and self._thread and self._thread.is_alive():
                 self._config = config
                 return self.status()
             self.stop()
@@ -353,6 +372,7 @@ class WechatGateway:
                 self._report("connection_failed", error)
                 return self.status()
             self._stopping = False
+            connection.update(reset_login=reset_login, generation=self._generation)
             self._set(state="connecting", error=None)
             self._thread = threading.Thread(target=self._run_thread, args=(connection,), name="agentcall-wechat", daemon=True)
             self._thread.start()
@@ -360,6 +380,9 @@ class WechatGateway:
 
     def _run_thread(self, connection):
         loop = asyncio.new_event_loop()
+        if connection['generation'] != self._generation:
+            loop.close()
+            return
         asyncio.set_event_loop(loop)
         self._loop = loop
         self._task = loop.create_task(self._run(connection))
@@ -374,23 +397,32 @@ class WechatGateway:
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
-            self._loop = None
-            self._client = None
+            if self._loop is loop:
+                self._loop = None
+                self._client = None
 
     async def _run(self, connection):
         connection = dict(connection, cache_dir=str(self.data_dir / "wechat-sdk"))
         delay = 1
-        while not self._stopping:
+        generation = connection['generation']
+        while not self._stopping and generation == self._generation:
             client = None
             try:
                 client = self._factory(connection)
+                if generation != self._generation:
+                    return
                 self._client = client
-                await client.run(self._event)
+                def current_event(event, payload, expected_client=client):
+                    if generation == self._generation and self._client is expected_client:
+                        self._event(event, payload)
+                await client.run(current_event)
                 if not self._stopping:
                     raise ConnectionError("event stream ended")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if generation != self._generation:
+                    return
                 error = _error(exc)
                 previous = self.status().get('error') or {}
                 if previous.get('code') == 'WECHAT_LOGIN_REJECTED':
@@ -399,7 +431,8 @@ class WechatGateway:
                           qr_code=None, error=error.as_dict())
                 self._report("connection_failed", error)
             finally:
-                self._client = None
+                if self._client is client:
+                    self._client = None
                 if client:
                     try:
                         await asyncio.wait_for(client.close(), 3)
@@ -412,11 +445,18 @@ class WechatGateway:
     def _event(self, event, payload):
         if event == "scan":
             state = str(payload.get("qr_status") or "").lower()
+            current = self.status()
+            if (current.get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
+                return  # Preserve the rejection until an explicit new attempt.
+            qr = payload.get('qr_code')
+            if state in {'scanned', 'confirmed', '3', '4'} and (
+                    not current.get('qr_code') or qr != current['qr_code']):
+                return  # Puppet Service replays cached scan events on reconnect.
             # Web WeChat's 408 is a long-poll timeout, not QR invalidation.
             # The pinned puppet labels it Timeout and supplies a usable QR.
             expired = state in {"cancel", "unknown", "1", "0"}
             self._set(state="awaiting_scan", available=False, logged_in=False, account=None,
-                      qr_code=None if expired else payload.get("qr_code"),
+                      qr_code=None if expired else qr,
                       qr_status=payload.get("qr_status"), qr_updated_at=_now(), error=None)
         elif event == "login":
             self._set(state="logged_in", logged_in=True, available=False, account=payload,
@@ -571,6 +611,7 @@ class WechatGateway:
 
     def stop(self):
         with self._lifecycle:
+            self._generation += 1
             self._stopping = True
             loop, task, thread = self._loop, self._task, self._thread
             if loop and not loop.is_closed() and task:
