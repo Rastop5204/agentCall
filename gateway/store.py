@@ -1,6 +1,7 @@
 """Durable queue and history. All state transitions are serialized in SQLite."""
 
 import json
+import re
 import fcntl
 import secrets
 import sqlite3
@@ -21,6 +22,10 @@ def stamp(value=None):
 def record_data(value):
     record = json.loads(value)
     record.setdefault('ignored_replies', [])
+    record.setdefault('channel', 'email')
+    record.setdefault('requested_channel', 'auto')
+    record.setdefault('recipient_label', record.get('target_email', ''))
+    record.setdefault('fallback_reason', None)
     return record
 
 
@@ -34,7 +39,7 @@ class Store:
             fcntl.flock(self.process_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.process_lock.close()
-            raise RuntimeError('此数据目录已有 EmailCall 服务正在运行。') from None
+            raise RuntimeError('此数据目录已有 agentCall 服务正在运行。') from None
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
         self.db = sqlite3.connect(self.directory / 'emailcall.sqlite3', check_same_thread=False)
@@ -55,14 +60,17 @@ class Store:
           CREATE TABLE IF NOT EXISTS ignored_replies (
             request_id TEXT NOT NULL, message_id TEXT NOT NULL, data TEXT NOT NULL,
             PRIMARY KEY(request_id,message_id));
+          CREATE TABLE IF NOT EXISTS wechat_inbox (
+            account_id TEXT NOT NULL, message_id TEXT NOT NULL, received_at TEXT NOT NULL,
+            PRIMARY KEY(account_id,message_id));
         ''')
         if not self.setting('token'):
             self.set_setting('token', secrets.token_urlsafe(32))
         # SMTP has no exactly-once delivery protocol. Never retry an uncertain DATA commit.
         for row in self.db.execute("SELECT data FROM records WHERE status='sending'").fetchall():
             record = record_data(row['data'])
-            self.fail(record['id'], {'code': 'DELIVERY_UNKNOWN', 'message': '服务在发送过程中停止，邮件投递结果未知。',
-                                     'hint': '请先检查目标邮箱，再决定是否以新请求重发，避免重复邮件。'})
+            self.fail(record['id'], {'code': 'DELIVERY_UNKNOWN', 'message': '服务在发送过程中停止，消息投递结果未知。',
+                                     'hint': '请先检查微信或目标邮箱，再决定是否以新请求重发，避免重复通知。'})
 
     def close(self):
         with self.lock:
@@ -117,7 +125,12 @@ class Store:
                       sender_email=config.get('email', ''), status=initial_status,
                       created_at=now, updated_at=now, sent_at=None, deadline_at=None,
                       timeout_seconds=payload.get('timeout_seconds', 300) if kind == 'ask' else None,
-                      message_id=f'<ec.{request_id}@emailcall.local>', error=error, reply=None, replies=[],
+                      message_id=f'<ac.{request_id}@agentcall.local>', error=error, reply=None, replies=[],
+                      requested_channel=payload.get('channel', 'auto'), channel=payload.get('_channel', 'email'),
+                      target_contact_id=payload.get('_target_contact_id', ''), target_contact_name=payload.get('_target_contact_name', ''),
+                      wechat_account_id=payload.get('_wechat_account_id', ''),
+                      recipient_label=payload.get('_recipient_label') or config.get('target_email', ''),
+                      fallback_reason=payload.get('_fallback_reason'), transport_message_id=None,
                       ignored_replies=[], events=[])
         self._event(record, record['status'], error['message'] if error else ('邮箱连接检查完成。' if kind == 'diagnostic' else '请求已保存，等待发送。'))
         with self.lock, self.db:
@@ -133,18 +146,34 @@ class Store:
                 return None
             record = record_data(row['data'])
             record['status'] = 'sending'
+            record['sending_at'] = stamp()
             if record['kind'] == 'ask':
                 record['deadline_at'] = stamp(utcnow() + timedelta(seconds=record['timeout_seconds']))
-            self._event(record, 'sending', '正在通过加密连接发送邮件。')
+            self._event(record, 'sending', '正在检查可用通道并发送消息。')
             self._save(record)
             return record
 
-    def mark_sent(self, request_id):
+    def set_route(self, request_id, channel, fallback_reason=None):
         with self.lock, self.db:
             record = self.get(request_id)
-            record['status'] = 'waiting' if record['kind'] == 'ask' else 'sent'
+            record['channel'], record['fallback_reason'] = channel, fallback_reason
+            record['recipient_label'] = record.get('target_contact_name', record['recipient_label']) if channel == 'wechat' else record['target_email']
+            label = '微信' if channel == 'wechat' else '邮箱'
+            self._event(record, 'fallback' if fallback_reason else 'route',
+                        ('微信不可用，改用邮箱：' + fallback_reason['message']) if fallback_reason else ('本次通过' + label + '发送。'))
+            self._save(record)
+            return record
+
+    def mark_sent(self, request_id, transport_message_id=None):
+        with self.lock, self.db:
+            record = self.get(request_id)
+            timely_reply = record['reply'] and not record['reply'].get('late')
+            record['status'] = ('replied' if timely_reply else 'waiting') if record['kind'] == 'ask' else 'sent'
             record['sent_at'] = stamp()
-            self._event(record, record['status'], '邮件服务器已接收，等待用户回复。' if record['kind'] == 'ask' else '邮件服务器已接收。')
+            if transport_message_id:
+                record['transport_message_id'] = transport_message_id
+            label = '微信服务' if record['channel'] == 'wechat' else '邮件服务器'
+            self._event(record, record['status'], label + '已接收消息。' + ('等待用户回复。' if record['status'] == 'waiting' else ''))
             self._save(record)
 
     def fail(self, request_id, error):
@@ -154,10 +183,12 @@ class Store:
             self._event(record, 'failed', error['message'])
             self._save(record)
 
-    def diagnostic(self, checks):
+    def diagnostic(self, checks, channel='email'):
         error = next((c['error'] for c in checks if not c['ok']), None)
-        body = '\n'.join(f"{c['name']}: " + ('连接成功' if c['ok'] else c['error']['message']) for c in checks)
-        record = self.insert('diagnostic', {'subject': '邮箱连接检查', 'body': body, 'agent_name': 'EmailCall'}, self.config(), error=error)
+        body = '\n'.join(f"{c['name']}: " + ('连接成功' if c['ok'] else c['error']['message'] +
+                         ('\n' + c['error']['hint'] if c['error'].get('hint') else '')) for c in checks)
+        record = self.insert('diagnostic', {'subject': ('微信' if channel == 'wechat' else '邮箱') + '连接检查', 'body': body,
+                            'agent_name': 'agentCall', '_channel': channel}, self.config(), error=error)
         return self.get(record['id'])
 
     def expire(self, now=None, mailbox_checked=False):
@@ -168,7 +199,8 @@ class Store:
                 deadline = datetime.fromisoformat(record['deadline_at'])
                 # A final IMAP sweep can observe a timely arrival just after the deadline.
                 # During outages the independent clock still ends waiting within 30 seconds.
-                if deadline + timedelta(seconds=0 if mailbox_checked else 30) <= now:
+                grace = 0 if record['channel'] == 'wechat' or mailbox_checked else 30
+                if deadline + timedelta(seconds=grace) <= now:
                     record['status'] = 'timed_out'
                     self._event(record, 'timed_out', '等待时间已结束，Agent 将根据任务风险自行决定下一步；后续回复仍会保存。')
                     self._save(record)
@@ -183,22 +215,33 @@ class Store:
     def add_reply(self, item):
         with self.lock, self.db:
             record = self.get(item['request_id'])
-            if not record or item.get('ignored_reason') or record['target_email'].casefold() != item['from_email'].casefold():
+            if not record or item.get('ignored_reason'):
+                return False
+            if record['channel'] == 'wechat':
+                if item.get('channel') != 'wechat' or record.get('target_contact_id') != item.get('from_contact_id') or record.get('wechat_account_id') != item.get('account_id'):
+                    return False
+            elif item.get('channel', 'email') != 'email' or record['target_email'].casefold() != item.get('from_email', '').casefold():
                 return False
             if self.db.execute('SELECT 1 FROM replies WHERE request_id=? AND message_id=?',
                                (record['id'], item['message_id'])).fetchone():
                 return False
             late = record['status'] == 'timed_out' or bool(record['deadline_at'] and
                    datetime.fromisoformat(item['received_at']) > datetime.fromisoformat(record['deadline_at']))
-            reply = {k: item[k] for k in ('message_id', 'from_email', 'body', 'received_at')}
+            reply = {k: item[k] for k in ('message_id', 'from_email', 'from_contact_id', 'from_name', 'body', 'received_at', 'account_id') if k in item}
+            reply['channel'] = record['channel']
             reply['late'] = late
+            if record['status'] == 'failed':
+                reply['unconfirmed'] = True
             self.db.execute('INSERT INTO replies VALUES (?,?,?)', (record['id'], item['message_id'], json.dumps(reply)))
             record['replies'].append(reply)
             if record['reply'] is None:
                 record['reply'] = reply
             if record['kind'] == 'ask' and record['status'] == 'waiting' and not late:
                 record['status'], record['reply'] = 'replied', reply
-            self._event(record, 'late_reply' if late else 'reply', '收到超时后的回复，已归档。' if late else '收到用户回复。')
+            if reply.get('unconfirmed'):
+                self._event(record, 'reply_unconfirmed', '收到明确关联的回复并归档；原发送结果未知，请求状态未自动改变。')
+            else:
+                self._event(record, 'late_reply' if late else 'reply', '收到超时后的回复，已归档。' if late else '收到用户回复。')
             self._save(record)
             return True
 
@@ -211,13 +254,13 @@ class Store:
             if self.db.execute('SELECT 1 FROM ignored_replies WHERE request_id=? AND message_id=?',
                                (record['id'], item['message_id'])).fetchone():
                 return False
-            reply = {k: item[k] for k in ('message_id', 'from_email', 'body', 'received_at')}
+            reply = {k: item[k] for k in ('message_id', 'from_email', 'from_contact_id', 'from_name', 'body', 'received_at', 'account_id', 'channel') if k in item}
             reply['ignored_reason'] = item['ignored_reason']
             self.db.execute('INSERT INTO ignored_replies VALUES (?,?,?)',
                             (record['id'], item['message_id'], json.dumps(reply)))
             record['ignored_replies'].append(reply)
             self._event(record, 'ignored_reply',
-                        f"收到来自 {reply['from_email']} 的邮件，未采纳为回复：{reply['ignored_reason']['message']}")
+                        f"收到来自 {reply.get('from_email') or reply.get('from_name') or reply.get('from_contact_id')} 的消息，未采纳为回复：{reply['ignored_reason']['message']}")
             self._save(record)
             return True
 
@@ -227,9 +270,85 @@ class Store:
         with self.lock:
             rows = self.db.execute("""SELECT data FROM records WHERE kind IN ('ask','notify')
                 AND status IN ('waiting','sent','timed_out','replied') AND created_at>=?
+                AND COALESCE(json_extract(data,'$.channel'),'email')='email'
                 ORDER BY (status='waiting') DESC,created_at DESC LIMIT 300""", (cutoff,)).fetchall()
             sender = self.config().get('email', '')
             return [rec for row in rows if (rec := record_data(row['data']))['sender_email'] == sender]
+
+    def add_wechat_message(self, item):
+        """Correlate only one-to-one replies to the snapshotted account/contact.
+
+        A plain reply can answer exactly one live question. Parallel questions
+        require their explicit request marker; ambiguity is recorded, never guessed.
+        """
+        if not all(isinstance(item.get(k), str) and item[k] for k in ('message_id', 'from_contact_id', 'account_id', 'body', 'received_at')):
+            return False
+        item = {**item, 'body': item['body'][:32000], 'channel': 'wechat'}
+        try:
+            received = datetime.fromisoformat(item['received_at'].replace('Z', '+00:00'))
+            if received.tzinfo is None or received > utcnow() + timedelta(seconds=30):
+                return False
+        except ValueError:
+            return False
+        with self.lock, self.db:
+            if self.db.execute('SELECT 1 FROM wechat_inbox WHERE account_id=? AND message_id=?', (item['account_id'], item['message_id'])).fetchone():
+                return False
+            tokens = set(re.findall(r'\[(?:AC|EC):([A-Za-z0-9_-]+)\]', item['body']))
+            reference = item.get('reference_id')
+            cutoff = stamp(utcnow() - timedelta(days=30))
+            rows = self.db.execute("""SELECT data FROM records WHERE kind IN ('ask','notify')
+                AND json_extract(data,'$.channel')='wechat'
+                AND status IN ('sending','waiting','sent','replied','timed_out','failed') AND created_at>=?
+                ORDER BY (id=? OR json_extract(data,'$.transport_message_id')=?) DESC,
+                (status IN ('waiting','sending')) DESC,created_at DESC LIMIT 300""",
+                (cutoff, next(iter(tokens)) if len(tokens) == 1 else '', reference or '')).fetchall()
+            records = [record_data(row['data']) for row in rows]
+            records = [r for r in records if r['status'] != 'failed' or (r.get('error') or {}).get('code') in
+                       ('WECHAT_SEND_UNCERTAIN', 'WECHAT_DELIVERY_UNKNOWN', 'DELIVERY_UNKNOWN')]
+            related = [r for r in records if r.get('target_contact_id') == item['from_contact_id'] and r.get('wechat_account_id') == item['account_id']]
+            conflicting = False
+            if tokens:
+                matches = [r for r in records if len(tokens) == 1 and r['id'] in tokens]
+                referenced = [r for r in records if reference and r.get('transport_message_id') == reference]
+                if referenced and matches and referenced[0]['id'] != matches[0]['id']:
+                    matches, conflicting = [], True
+            elif reference:
+                matches = [r for r in records if r.get('transport_message_id') == reference]
+            else:
+                matches = [r for r in records if r['kind'] == 'ask' and r['status'] in ('waiting','sending')
+                           and r.get('target_contact_id') == item['from_contact_id'] and r.get('wechat_account_id') == item['account_id']]
+                # Safety must not depend on the bounded display/matching window.
+                unresolved = self.db.execute("""SELECT 1 FROM records WHERE kind='ask' AND created_at>=?
+                    AND json_extract(data,'$.channel')='wechat'
+                    AND json_extract(data,'$.target_contact_id')=?
+                    AND json_extract(data,'$.wechat_account_id')=?
+                    AND json_extract(data,'$.reply') IS NULL
+                    AND (status='timed_out' OR (status='failed' AND json_extract(data,'$.error.code')
+                        IN ('WECHAT_SEND_UNCERTAIN','WECHAT_DELIVERY_UNKNOWN','DELIVERY_UNKNOWN')))
+                    LIMIT 1""", (cutoff, item['from_contact_id'], item['account_id'])).fetchone()
+                if unresolved:
+                    matches, conflicting = [], True
+            matches = [r for r in matches if received >= datetime.fromisoformat(r.get('sending_at') or r['created_at']).replace(microsecond=0)]
+            if len(matches) == 1:
+                record = matches[0]
+                if record.get('wechat_account_id') != item['account_id']:
+                    return False
+                item['request_id'] = record['id']
+                if record.get('target_contact_id') != item['from_contact_id']:
+                    item['ignored_reason'] = dict(code='WECHAT_SENDER_MISMATCH', message='微信回复并非来自此请求的目标联系人。', hint='只有所选联系人可以回复此请求。')
+                    saved = self.add_ignored_reply(item)
+                else:
+                    item['body'] = re.sub(r'\[(?:AC|EC):' + re.escape(record['id']) + r'\]', '', item['body']).strip()
+                    saved = bool(item['body']) and self.add_reply(item)
+            elif related:
+                self.diagnostic([{'name': '微信回复匹配', 'ok': False, 'error': dict(code='WECHAT_REPLY_AMBIGUOUS' if len(matches) > 1 or conflicting else 'WECHAT_REPLY_UNMATCHED',
+                    message='收到目标联系人的微信消息，但无法安全确定回复归属，已保存且未作为决策。',
+                    hint='请在回复中保留对应问题的 [AC:请求编号]。回复内容：' + item['body'])}], channel='wechat')
+                saved = False
+            else:
+                return False
+            self.db.execute('INSERT INTO wechat_inbox VALUES (?,?,?)', (item['account_id'], item['message_id'], item['received_at']))
+            return saved
 
     def has_active(self):
         with self.lock:

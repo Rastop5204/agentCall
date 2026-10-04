@@ -122,7 +122,7 @@ class MailTransportTests(unittest.TestCase):
         self.assertEqual(message["Message-ID"], RECORD["message_id"])
         self.assertEqual(envelope_to, [RECORD["target_email"]])
         self.assertEqual(envelope_from, CONFIG["email"])
-        self.assertIn("[EC:" + RECORD["id"] + "]", str(message["Subject"]))
+        self.assertIn("[AC:" + RECORD["id"] + "]", str(message["Subject"]))
         self.assertIn("2026-10-04", message.get_content())
         self.assertIn("UTC", message.get_content())
         self.assertIn("直接回复", message.get_content())

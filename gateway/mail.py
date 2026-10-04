@@ -26,7 +26,7 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_REPLY_CHARS = 32000
 MAX_CANDIDATES = 100
 _ID = re.compile(r"<[^<>\s]+>")
-_SUBJECT_TOKEN = re.compile(r"\[EC:([A-Za-z0-9_-]+)\]")
+_SUBJECT_TOKEN = re.compile(r"\[(?:AC|EC):([A-Za-z0-9_-]+)\]")
 
 
 class MailError(Exception):
@@ -137,7 +137,7 @@ def _imap_id(client):
         return
     # imaplib's command table is module-global; this is a stable RFC extension.
     imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
-    result, _ = client._simple_command("ID", '("name" "EmailCall" "version" "1.0.0" "vendor" "EmailCall")')
+    result, _ = client._simple_command("ID", '("name" "agentCall" "version" "2.0.0" "vendor" "agentCall")')
     if result != "OK":
         raise MailError("IMAP_CLIENT_REJECTED", "收件服务器拒绝了客户端标识。", "请在邮箱设置中允许第三方客户端使用 IMAP。")
 
@@ -202,24 +202,24 @@ def send_message(config: dict, record: dict) -> None:
     """Send one persisted request; do not retry an ambiguous SMTP delivery."""
     try:
         message = EmailMessage(policy=policy.SMTP)
-        message["From"] = formataddr(("EmailCall · " + (record.get("agent_name") or "Agent"), config["email"]))
+        message["From"] = formataddr(("agentCall · " + (record.get("agent_name") or "Agent"), config["email"]))
         message["To"] = record["target_email"]
         message["Reply-To"] = config["email"]
         message["Message-ID"] = record["message_id"]
         message["Date"] = format_datetime(datetime.now(timezone.utc))
-        message["Subject"] = record["subject"] + " [EC:" + record["id"] + "]"
+        message["Subject"] = record["subject"] + " [AC:" + record["id"] + "]"
         message["Auto-Submitted"] = "auto-generated"
         message["X-Auto-Response-Suppress"] = "All"
         body = record["body"].rstrip()
         if record["kind"] == "ask":
             deadline = _parse_time(record["deadline_at"]) if record.get("deadline_at") else datetime.now(timezone.utc) + timedelta(seconds=record.get("timeout_seconds", 300))
-            body += ("\n\n—— EmailCall · 等待您的回复 ——\n"
+            body += ("\n\n—— agentCall · 等待您的回复 ——\n"
                      "请直接回复此邮件，保留邮件主题，以告知 Agent 您的选择。\n"
                      "回复截止：" + deadline.strftime("%Y-%m-%d %H:%M:%S UTC") + "。\n"
                      "截止后本次等待会自动结束，Agent 将依据任务要求自行判断下一步。"
                      "逾期回复仍会被记录，但不会作为本次等待的及时决策。")
         else:
-            body += "\n\n—— EmailCall · 来自 Agent 的提醒 ——"
+            body += "\n\n—— agentCall · 来自 Agent 的提醒 ——"
         message.set_content(body)
         with _smtp(config) as client:
             rejected = client.send_message(message, from_addr=config["email"], to_addrs=[record["target_email"]])
@@ -304,7 +304,7 @@ def _trim_quotes(text: str) -> str:
                 or re.match(r"^在\s?.+(?:写道|寫道)[：:]\s*$", stripped)
                 or re.match(r"^.+[>＞]\s*在\s*\d{4}年\d{1,2}月\d{1,2}日.+(?:写道|寫道)[：:]\s*$", unescape(stripped))
                 or re.match(r"^-{2,}\s*(?:Original Message|原始邮件|原始郵件|转发邮件|Forwarded message)\s*-*", stripped, re.I)
-                or stripped == "—— EmailCall · 等待您的回复 ——"):
+                or stripped in {"—— EmailCall · 等待您的回复 ——", "—— agentCall · 等待您的回复 ——"}):
             break
         if re.match(r"^(?:From|发件人|寄件者)\s*[：:]", stripped, re.I):
             following = "\n".join(lines[index + 1:index + 5])

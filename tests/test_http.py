@@ -45,6 +45,26 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('/api/token')[0], 401)
         self.assertEqual(self.request('/api/token', headers={'Authorization': 'Bearer '+self.store.token()})[0], 403)
 
+    def test_agent_can_probe_channels_but_cannot_access_wechat_login_or_contacts(self):
+        headers = {'Authorization': 'Bearer ' + self.store.token()}
+        status, _, data = self.request('/api/channels', headers=headers)
+        self.assertEqual(status, 200)
+        self.assertFalse(data['available'])
+        self.assertNotIn('qr_code', data['wechat'])
+        for path in ('/api/wechat', '/api/wechat/contacts'):
+            self.assertEqual(self.request(path, headers=headers)[0], 403)
+        self.assertEqual(self.request('/api/wechat/login', 'POST', {}, headers)[0], 403)
+
+    def test_wechat_check_failures_are_persistent_records(self):
+        _, headers, session = self.request('/api/session')
+        ui = {'Cookie': headers['Set-Cookie'].split(';')[0], 'X-CSRF-Token': session['csrf_token']}
+        status, _, data = self.request('/api/wechat/test', 'POST', {}, ui)
+        self.assertEqual(status, 200)
+        self.assertFalse(data['ok'])
+        record = self.store.get(data['record_id'])
+        self.assertEqual(record['channel'], 'wechat')
+        self.assertEqual(record['status'], 'failed')
+
     def test_csrf_cookie_and_header_both_required(self):
         status, headers, data = self.request('/api/session')
         self.assertEqual(status, 200)

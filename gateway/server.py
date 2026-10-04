@@ -54,7 +54,7 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'EmailCall/1.0'
+    server_version = 'agentCall/2.0'
     sys_version = ''
 
     def setup(self):
@@ -101,7 +101,7 @@ class Handler(BaseHTTPRequestHandler):
         seed = f'{int(time.time())}.{secrets.token_urlsafe(24)}'
         cookie = seed + '.' + self.signature(seed)
         return self.respond(200, {'csrf_token': self.signature('csrf:' + cookie)}, headers={
-            'Set-Cookie': f'emailcall_session={cookie}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=86400'})
+            'Set-Cookie': f'agentcall_session={cookie}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=86400'})
 
     def authenticate(self, ui_only=False):
         authorization = self.headers.get('Authorization', '')
@@ -115,7 +115,7 @@ class Handler(BaseHTTPRequestHandler):
         cookies = SimpleCookie()
         try:
             cookies.load(self.headers.get('Cookie', ''))
-            cookie = cookies['emailcall_session'].value
+            cookie = (cookies.get('agentcall_session') or cookies['emailcall_session']).value
             seed, signature = cookie.rsplit('.', 1)
             age = time.time() - int(seed.split('.', 1)[0])
             valid = 0 <= age < 86400 and secrets.compare_digest(signature.encode(), self.signature(seed).encode())
@@ -148,18 +148,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def export_skill(self):
         stream = io.BytesIO()
-        folder = ROOT / 'skills' / 'emailcall'
+        folder = ROOT / 'skills' / 'agentcall'
         if not (folder / 'SKILL.md').exists():
             raise APIError('SKILL_UNAVAILABLE', 'Skill 模板尚未安装。', status=503)
         with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(folder.rglob('*')):
                 if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc' and path.name != 'config.json':
-                    archive.write(path, 'emailcall/' + path.relative_to(folder).as_posix())
+                    archive.write(path, 'agentcall/' + path.relative_to(folder).as_posix())
             config = {'base_url': f'http://127.0.0.1:{self.server.server_address[1]}', 'token': self.server.app.store.token()}
-            info = zipfile.ZipInfo('emailcall/config.json')
+            info = zipfile.ZipInfo('agentcall/config.json')
             info.external_attr = 0o600 << 16
             archive.writestr(info, json.dumps(config, indent=2))
-        self.respond(200, stream.getvalue(), 'application/zip', {'Content-Disposition': 'attachment; filename="emailcall-skill.zip"'})
+        self.respond(200, stream.getvalue(), 'application/zip', {'Content-Disposition': 'attachment; filename="agentcall-skill.zip"'})
 
     def static(self, path):
         if path in ('/', '/frontend'):
@@ -187,12 +187,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.static(path)
         if method == 'GET' and path == '/api/health':
             return self.respond(200, {'status': 'ok', 'version': __version__, 'instance_id': self.server.instance_id,
-                                      'configured': bool(app.store.config())})
+                                      'configured': bool(app.store.config()) or app.channels.config()['enabled']})
         if method == 'GET' and path == '/api/session':
             return self.session()
-        agent_route = path in ('/api/notify', '/api/ask') or path.startswith('/api/requests/')
+        agent_route = path in ('/api/notify', '/api/ask', '/api/channels') or path.startswith('/api/requests/')
         self.authenticate(ui_only=not agent_route)
         if method == 'GET':
+            if path == '/api/channels':
+                return self.respond(200, app.channels.selection())
+            if path == '/api/wechat':
+                return self.respond(200, app.wechat_view(probe=query.get('probe', ['0'])[0] == '1'))
+            if path == '/api/wechat/contacts':
+                return self.respond(200, app.channels.contacts(query.get('q', [''])[0]))
             if path == '/api/config':
                 return self.respond(200, app.config_view())
             if path == '/api/token':
@@ -220,6 +226,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, app.wait_request(request_id, seconds))
         if method == 'PUT' and path == '/api/config':
             return self.respond(200, app.save_config(self.read_json()))
+        if method == 'PUT' and path == '/api/wechat':
+            return self.respond(200, app.save_wechat_config(self.read_json()))
         if method == 'POST':
             data = self.read_json()
             if path in ('/api/notify', '/api/ask'):
@@ -227,7 +235,13 @@ class Handler(BaseHTTPRequestHandler):
                 record = app.create(kind, data, self.headers.get('Idempotency-Key'))
                 return self.respond(202, record)
             if path == '/api/config/test':
-                return self.respond(200, app.test_config())
+                return self.respond(200, app.test_config(data.get('channel', 'email')))
+            if path == '/api/wechat/login':
+                return self.respond(200, app.channels.login())
+            if path == '/api/wechat/logout':
+                return self.respond(200, app.channels.logout())
+            if path == '/api/wechat/test':
+                return self.respond(200, app.channels.check())
             if path == '/api/token/rotate':
                 return self.respond(200, {'token': app.store.rotate_token()})
         raise APIError('NOT_FOUND', '接口或请求方法不存在。', status=404)

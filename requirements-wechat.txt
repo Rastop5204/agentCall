@@ -1,0 +1,12 @@
+# python-wechaty 0.10.x requires Python 3.10 (upstream dataclass defaults).
+# Keep generated gRPC stubs and their runtime on the compatible major version.
+wechaty==0.10.7
+wechaty-puppet==0.4.23
+wechaty-puppet-service==0.8.10
+wechaty-grpc==0.20.19
+pyee==8.2.2
+betterproto==1.2.5
+grpclib==0.4.7
+qrcode==7.4.2
+# UrlLink imports urllib3.get_host, which was removed in urllib3 2.x.
+urllib3==1.26.20

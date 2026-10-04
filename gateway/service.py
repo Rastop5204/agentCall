@@ -62,7 +62,7 @@ def email_address(data, name):
 
 
 class Gateway:
-    def __init__(self, store, transport=None):
+    def __init__(self, store, transport=None, wechat_transport=None):
         self.store = store
         if transport is None:
             from gateway import mail
@@ -75,12 +75,30 @@ class Gateway:
         self.diagnostic_lock = threading.Lock()
         self.imap_scan_state = {}
         self.imap_scan_identity = None
+        from gateway.channels import Channels
+        self.channels = Channels(store, self.receive_wechat, wechat_transport)
 
     def config_view(self):
         config = {**DEFAULT_CONFIG, **self.store.config()}
         config['password_set'] = bool(config.pop('password', ''))
-        return {'config': config, 'providers': PROVIDERS,
-                'service': {'configured': bool(self.store.config()), 'poll_error': self.poll_error, 'last_poll_at': self.last_poll_at}}
+        return {'config': config, 'providers': PROVIDERS, 'wechat': self.wechat_view(),
+                'service': {'configured': bool(self.store.config()) or self.channels.config()['enabled'], 'email_configured': bool(self.store.config()), 'poll_error': self.poll_error, 'last_poll_at': self.last_poll_at}}
+
+    def wechat_view(self, probe=False):
+        return self.channels.view(probe)
+
+    def save_wechat_config(self, data):
+        try:
+            return self.channels.save(data)
+        except APIError:
+            raise
+        except Exception as exc:
+            from gateway.channels import safe_error
+            error = safe_error(exc)
+            raise APIError(error['code'], error['message'], error['hint'], 503) from None
+
+    def receive_wechat(self, item):
+        return self.store.add_wechat_message(item)
 
     def save_config(self, data):
         fields = set(DEFAULT_CONFIG) | {'password', 'password_set'}
@@ -124,6 +142,10 @@ class Gateway:
         if key is not None and (not 8 <= len(key) <= 200 or not re.fullmatch(r'[A-Za-z0-9._:-]+', key)):
             raise APIError('INVALID_IDEMPOTENCY_KEY', 'Idempotency-Key 必须是 8–200 位字母、数字或 . _ : -。')
         fingerprint = hashlib.sha256(json.dumps([kind, data], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        # A fresh probe happens before taking the SQLite lock, and again in the
+        # sender. A cached login flag cannot select the transport for a request.
+        requested = data.get('channel', 'auto')
+        selection = self.channels.selection(requested if isinstance(requested, str) else 'auto')
         # Deduplication and creation share one lock, including requests from different HTTP threads.
         with self.store.lock:
             existing = self.store.by_key(key) if key else None
@@ -134,26 +156,43 @@ class Gateway:
                 return record
             payload = {}
             try:
-                if set(data) - {'subject', 'body', 'agent_name', 'timeout_seconds'}:
+                if set(data) - {'subject', 'body', 'agent_name', 'timeout_seconds', 'channel'}:
                     raise APIError('INVALID_INPUT', '请求包含不支持的字段。', '收件人固定为配置中的目标邮箱。')
                 payload['subject'] = text_field(data, 'subject', 200)
                 payload['body'] = text_field(data, 'body', 50000, single_line=False)
                 payload['agent_name'] = text_field(data, 'agent_name', 80, required=False) or 'Agent'
+                if requested not in ('auto', 'wechat', 'email'):
+                    raise APIError('INVALID_INPUT', '通道应为 auto、wechat 或 email。')
+                payload['channel'] = requested
+                wx = self.channels.config()
+                payload.update(_channel=selection['selected_channel'] or ('wechat' if requested == 'wechat' else 'email'),
+                               _target_contact_id=wx['target_contact_id'], _wechat_account_id=wx['account_id'],
+                               _target_contact_name=wx['target_contact_name'],
+                               _recipient_label=wx['target_contact_name'] if selection['selected_channel'] == 'wechat' else self.store.config().get('target_email', ''),
+                               _fallback_reason=selection['fallback_reason'])
                 if kind == 'ask':
                     payload['timeout_seconds'] = integer(data, 'timeout_seconds', 300, 30, 86400)
-                if not self.store.config():
-                    raise APIError('NOT_CONFIGURED', '邮箱尚未配置，无法发送邮件。', '请先在配置页面保存发送邮箱与目标邮箱。', 409)
+                if not selection['selected_channel']:
+                    reason = selection['wechat'].get('error') if requested == 'wechat' else None
+                    if reason:
+                        raise APIError(reason['code'], reason['message'], reason.get('hint', ''), 409)
+                    raise APIError('NOT_CONFIGURED', '没有可用的通知通道。', '请登录微信并选择联系人，或保存邮箱配置作为备用通道。', 409)
                 if self.store.active_count() >= 100:
                     raise APIError('QUEUE_FULL', '同时进行的请求已达到 100 条。', '请等待现有请求结束后，以新的请求标识重试。', 429)
             except APIError as exc:
                 safe = {k: str(data.get(k, ''))[:50000 if k == 'body' else 200] for k in ('subject', 'body', 'agent_name')}
                 safe['timeout_seconds'] = 300
+                safe.update({k: v for k, v in payload.items() if k.startswith('_') or k == 'channel'})
                 record = self.store.insert(kind, safe, self.store.config(), key, fingerprint, exc.error)
                 exc.request_id = record['id']
                 raise
             return self.store.insert(kind, payload, self.store.config(), key, fingerprint)
 
-    def test_config(self):
+    def test_config(self, channel='email'):
+        if channel not in ('email', 'wechat', 'auto'):
+            raise APIError('INVALID_INPUT', '请选择有效的连接检查通道。')
+        if channel == 'wechat' or (channel == 'auto' and self.channels.selection()['selected_channel'] == 'wechat'):
+            return self.channels.check()
         if not self.diagnostic_lock.acquire(blocking=False):
             raise APIError('TEST_IN_PROGRESS', '邮箱连接检查正在进行，请稍后。', status=409)
         try:
@@ -173,6 +212,27 @@ class Gateway:
         if not record:
             return False
         try:
+            selection = self.channels.selection(record.get('requested_channel', 'auto'))
+            channel = selection['selected_channel']
+            if not channel:
+                from gateway.channels import channel_error
+                self.store.fail(record['id'], selection['wechat'].get('error') or channel_error('NO_CHANNEL_AVAILABLE', '微信不可用且没有可用的邮箱配置。', '请恢复微信登录或配置备用邮箱。'))
+                return True
+            record = self.store.set_route(record['id'], channel, selection['fallback_reason'])
+            if channel == 'wechat':
+                try:
+                    result = self.channels.wechat.send(record)
+                except Exception as exc:
+                    from gateway.channels import safe_error
+                    error = safe_error(exc)
+                    if getattr(exc, 'safe_to_fallback', False) and record.get('requested_channel', 'auto') == 'auto' and self.store.config():
+                        record = self.store.set_route(record['id'], 'email', error)
+                    else:
+                        self.store.fail(record['id'], error)
+                        return True
+                else:
+                    self.store.mark_sent(record['id'], result.get('message_id') if isinstance(result, dict) else None)
+                    return True
             self.transport.send_message(self.store.config(), record)
         except Exception as exc:
             self.store.fail(record['id'], self.transport.explain_error(exc, 'smtp'))
@@ -220,6 +280,7 @@ class Gateway:
             self.store.expire()
 
     def start(self):
+        self.channels.start()
         def sender():
             while not self.stop_event.is_set():
                 try:
@@ -254,6 +315,7 @@ class Gateway:
 
     def stop(self):
         self.stop_event.set()
+        self.channels.wechat.stop()
         with self.store.changed:
             self.store.changed.notify_all()
         for thread in self.threads:
