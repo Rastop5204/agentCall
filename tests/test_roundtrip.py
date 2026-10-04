@@ -120,6 +120,7 @@ class IMAPHandler(socketserver.StreamRequestHandler):
                 pass
             return
         self.send("* OK EmailCall local IMAP test")
+        identified = False
         while raw := self.rfile.readline(32768):
             line = raw.decode("ascii").strip()
             box.imap_commands.append(line)
@@ -128,8 +129,12 @@ class IMAPHandler(socketserver.StreamRequestHandler):
             if command == "CAPABILITY":
                 self.send("* CAPABILITY IMAP4rev1 ID")
             elif command == "ID":
+                identified = True
                 self.send('* ID ("name" "local-test-server")')
             elif command == "EXAMINE":
+                if not identified:
+                    self.send(tag + " NO EXAMINE Unsafe Login")
+                    continue
                 self.send("* FLAGS (\\Seen)")
                 self.send(f"* {len(box.inbox)} EXISTS")
                 self.send("* OK [UIDVALIDITY 1] UIDs valid")

@@ -153,6 +153,37 @@ class MailTransportTests(unittest.TestCase):
             mail.poll_replies(dict(CONFIG, provider="163"), [RECORD])
         self.assertIn("ID", commands)
 
+    def test_string_capabilities_identify_client_before_opening_163_inbox(self):
+        imap = FakeIMAP()
+        imap.capabilities = ("IMAP4REV1", "ID")
+        identified = False
+        def command(name, *args):
+            nonlocal identified
+            identified = name == "ID"
+            return "OK", [b"ID completed"]
+        def select(folder, readonly=False):
+            if not identified:
+                return "NO", [b"EXAMINE Unsafe Login. Please contact support@example.com"]
+            self.assertTrue(readonly)
+            return "OK", [b"0"]
+        imap._simple_command, imap.select = command, select
+        with patch.object(mail.imaplib, "IMAP4_SSL", return_value=imap):
+            self.assertEqual(mail.poll_replies(dict(CONFIG, provider="163"), [RECORD]), [])
+
+    def test_unsafe_login_does_not_claim_folder_is_missing_or_leak_response(self):
+        imap = FakeIMAP()
+        imap.select = lambda *args, **kwargs: ("NO", [b"EXAMINE Unsafe Login private-account@example.com secret"])
+        with patch.object(mail.imaplib, "IMAP4_SSL", return_value=imap):
+            with self.assertRaises(mail.MailError) as caught:
+                mail.poll_replies(CONFIG, [RECORD])
+        self.assertEqual(caught.exception.code, "IMAP_CLIENT_REJECTED")
+        self.assertNotIn("secret", str(caught.exception.as_dict()))
+        self.assertNotIn("private-account", str(caught.exception.as_dict()))
+
+    def test_unsafe_login_exception_is_client_rejection_not_bad_password(self):
+        error = mail.explain_error(imaplib.IMAP4.error("EXAMINE Unsafe Login"), "imap")
+        self.assertEqual(error["code"], "IMAP_CLIENT_REJECTED")
+
     def test_plaintext_transport_is_rejected(self):
         with self.assertRaises(mail.MailError) as caught:
             mail.send_message(dict(CONFIG, smtp_security="none"), RECORD)

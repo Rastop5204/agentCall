@@ -73,10 +73,10 @@ def explain_error(exc: Exception, phase: str = "smtp") -> dict:
     elif isinstance(exc, imaplib.IMAP4.error):
         # Detect only a bounded classification; never expose the source text.
         text = str(exc).lower()
-        if any(word in text for word in ("auth", "login", "password", "credential")):
+        if "unsafe" in text or "id command" in text:
+            result = ("IMAP_CLIENT_REJECTED", "邮箱服务商拦截了客户端访问。", "这通常是客户端身份声明或邮箱安全策略问题；请确认已开启 IMAP 并允许第三方客户端，文件夹名称无需因此修改。")
+        elif any(word in text for word in ("auth", "login", "password", "credential")):
             result = ("IMAP_AUTH_FAILED", "收件服务器拒绝了登录。", "请检查账号及应用专用密码／客户端授权码，并在邮箱设置中开启 IMAP。")
-        elif "unsafe" in text or "id command" in text:
-            result = ("IMAP_CLIENT_REJECTED", "收件服务器拒绝了客户端连接。", "请在邮箱设置中开启 IMAP，并允许第三方邮件客户端访问。")
         else:
             result = ("IMAP_PROTOCOL_ERROR", "收件服务器无法完成请求。", "请检查 IMAP 服务是否开启、文件夹名称是否正确，并稍后重试。")
     elif isinstance(exc, (ConnectionError, OSError)):
@@ -130,7 +130,8 @@ def _smtp(config: dict):
 
 def _imap_id(client):
     """163 requires IMAP ID; RFC 2971 is absent from imaplib's public API."""
-    if not any(cap.upper() == b"ID" for cap in client.capabilities):
+    # imaplib exposes capabilities as strings; some compatible clients use bytes.
+    if not any(cap.upper() in ("ID", b"ID") for cap in client.capabilities):
         return
     # imaplib's command table is module-global; this is a stable RFC extension.
     imaplib.Commands.setdefault("ID", ("AUTH", "SELECTED"))
@@ -154,8 +155,11 @@ def _imap(config: dict):
             raise MailError("TLS_REQUIRED", "邮件连接必须使用加密传输。", "请选择 SSL/TLS 或 STARTTLS。")
         client.login(config.get("username") or config["email"], config["password"])
         _imap_id(client)
-        status, _ = client.select(_imap_folder(config.get("imap_folder") or "INBOX"), readonly=True)
+        status, response = client.select(_imap_folder(config.get("imap_folder") or "INBOX"), readonly=True)
         if status != "OK":
+            error = explain_error(imaplib.IMAP4.error(str(response)), "imap")
+            if error["code"] in {"IMAP_CLIENT_REJECTED", "IMAP_AUTH_FAILED"}:
+                raise MailError(**error)
             raise MailError("IMAP_FOLDER_UNAVAILABLE", "无法打开指定的收件文件夹。", "请确认文件夹存在；通常应使用 INBOX。")
         yield client
     finally:
