@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#f5f7f5" />
-    <title>EmailCall · 让协作保持连接</title>
+    <title>agentCall · 让协作保持连接</title>
     <link rel="icon" href="/frontend/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/frontend/styles.css" />
     <script src="/frontend/app.js" type="module"></script>
@@ -14,11 +14,11 @@
     <a class="skip-link" href="#main-content">跳转至主要内容</a>
     <div class="app-shell">
       <aside class="sidebar" aria-label="主导航">
-        <a href="#config" class="brand" aria-label="EmailCall 首页"
+        <a href="#config" class="brand" aria-label="agentCall 首页"
           ><span class="brand-mark" data-icon="signal"></span
           ><span
-            >EmailCall<span class="brand-caption"
-              >AGENT MAIL GATEWAY</span
+            >agentCall<span class="brand-caption"
+              >AGENT MESSAGE GATEWAY</span
             ></span
           ></a
         >
@@ -36,7 +36,7 @@
         <div class="sidebar-note">
           <span class="note-orbit" data-icon="spark"></span>
           <p>你继续生活。<br />让 Agent 保持联系。</p>
-          <span>一封邮件，连接每个决策。</span>
+          <span>一条消息，连接每个决策。</span>
         </div>
         <div class="sidebar-bottom">
           <div class="local-status">
@@ -53,7 +53,7 @@
             ><span class="keyboard-hint">◐</span>
           </button>
           <div class="sidebar-footer">
-            <span>LOCAL FIRST</span><span>v1.0</span>
+            <span>LOCAL FIRST</span><span>v2.0</span>
           </div>
         </div>
       </aside>
@@ -71,19 +71,49 @@
           <header class="page-header">
             <div>
               <div class="eyebrow">
-                <span class="eyebrow-line"></span> YOUR AGENT, ONE EMAIL AWAY
+                <span class="eyebrow-line"></span> YOUR AGENT, ALWAYS IN REACH
               </div>
               <h1 id="config-title">
                 让每一次协作，都有回音<span class="title-dot">.</span>
               </h1>
-              <p>连接你的邮箱，让 Agent 在完成任务与需要决策时找到你。</p>
+              <p>微信优先，邮箱接力。让 Agent 在完成任务与需要决策时找到你。</p>
             </div>
             <span class="local-badge"
               ><span data-icon="shield"></span>仅在本机运行</span
             >
           </header>
           <div class="config-layout">
-            <form id="config-form" class="config-form">
+            <div class="config-main">
+              <div class="channel-tabs" role="tablist" aria-label="通信方式">
+                <button type="button" id="wechat-tab" class="channel-tab selected" role="tab" aria-selected="true" aria-controls="wechat-config-panel" data-channel-tab="wechat"><span data-icon="wechat"></span><span>微信<small>优先使用</small></span><span id="wechat-tab-status" class="channel-tab-status">未连接</span></button>
+                <button type="button" id="email-tab" class="channel-tab" role="tab" aria-selected="false" aria-controls="config-form" tabindex="-1" data-channel-tab="email"><span data-icon="mail"></span><span>邮箱<small>自动备用</small></span><span id="email-tab-status" class="channel-tab-status">未配置</span></button>
+              </div>
+              <p class="routing-note"><span data-icon="repeat"></span>每次发送前检查微信登录状态；微信不可用时，自动使用已保存的邮箱。</p>
+              <form id="wechat-config-panel" class="wechat-form" role="tabpanel" aria-labelledby="wechat-tab">
+                <section class="panel wechat-panel" aria-labelledby="wechat-title">
+                  <div class="panel-heading">
+                    <span class="step-number"><span data-icon="wechat"></span></span>
+                    <div><h2 id="wechat-title">用微信保持联系</h2><p>扫码连接你的微信，为 Agent 指定一位联系人。</p></div>
+                    <label class="toggle-control"><input type="checkbox" id="wechat-enabled" name="wechat_enabled"/><span class="toggle-track" aria-hidden="true"></span><span>启用微信</span></label>
+                  </div>
+                  <div id="wechat-status" class="wechat-status" role="status" aria-live="polite"><span class="status-dot"></span><div><strong id="wechat-status-title">尚未连接微信</strong><p id="wechat-status-description">保存设置后，扫码登录。</p></div></div>
+                  <div id="wechat-error" class="error-box wechat-error" hidden></div>
+                  <div class="wechat-login-layout">
+                    <div id="wechat-qr" class="wechat-qr" aria-label="微信登录二维码"><div class="qr-placeholder"><span data-icon="qr"></span><span>登录二维码会显示在这里</span></div></div>
+                    <div class="wechat-login-help"><h3 id="wechat-login-title">从一次扫码开始</h3><p id="wechat-login-help">点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新选择目标联系人。</p><button class="button primary" type="button" id="wechat-login"><span data-icon="qr"></span>扫码登录</button><div class="wechat-session-actions"><button class="text-button" type="button" id="wechat-refresh"><span data-icon="refresh"></span>刷新状态</button><button class="text-button" type="button" id="wechat-logout" hidden><span data-icon="logout"></span>断开并停用微信</button></div></div>
+                  </div>
+                  <details class="advanced-settings" id="wechat-advanced"><summary><span data-icon="sliders"></span>微信连接设置<span class="summary-info">Wechaty 服务</span><span class="disclosure-chevron" data-icon="chevron-down"></span></summary><div class="advanced-content"><p class="field-help wechat-service-help">本机模式随 Docker 一起运行，无需服务令牌。也可连接你已有的 Wechaty 服务。</p><div class="field"><label for="wechat-mode">连接方式</label><select id="wechat-mode"><option value="local">本机服务 · 推荐</option><option value="external">外部 Wechaty 服务</option></select></div><div id="wechat-external-settings" hidden><div class="field"><label for="wechat-endpoint">服务地址</label><input id="wechat-endpoint" name="wechat_endpoint" placeholder="your-wechaty-service:8788" spellcheck="false" autocomplete="off"/></div><div class="field"><label for="wechat-token">服务令牌 <span id="wechat-token-state" class="optional"></span></label><input type="password" id="wechat-token" name="wechat_token" placeholder="输入外部服务的访问令牌" autocomplete="new-password"/><p class="field-help">令牌只保存在本机，已保存的内容不会回显。</p></div></div></div></details>
+                </section>
+                <section class="panel target-panel wechat-target-panel" aria-labelledby="wechat-target-title"><div class="panel-heading"><span class="step-number">02</span><div><h2 id="wechat-target-title">消息发给谁</h2><p>选择一位已有微信联系人，通知与回复都与此人关联。</p></div><span class="heading-icon" data-icon="user"></span></div>
+                  <div id="wechat-selected-contact" class="selected-contact" hidden></div>
+                  <div class="contact-toolbar"><div class="search-field"><span data-icon="search"></span><input id="wechat-contact-search" type="search" placeholder="搜索联系人姓名或备注" aria-label="搜索微信联系人" autocomplete="off"/></div><button type="button" class="button secondary" id="wechat-load-contacts" disabled><span data-icon="refresh"></span>获取联系人</button></div>
+                  <div id="wechat-contacts" class="contact-list" role="group" aria-label="选择目标联系人"><p class="contact-empty">登录微信后，获取并选择联系人。</p></div>
+                  <p class="field-help">这里选择的是已有联系人；请先在微信中添加需要联系的人。</p>
+                  <div class="info-line"><span data-icon="shield"></span><span>仅接受所选联系人的私聊回复。群聊、其他人的消息不会作为你的决定。</span></div>
+                </section>
+                <div class="form-footer"><span id="wechat-save-status"><span data-icon="lock"></span>配置与登录会话持久保存</span><button class="button primary" id="save-wechat" type="submit"><span data-icon="check"></span>保存微信配置</button></div>
+              </form>
+              <form id="config-form" class="config-form" role="tabpanel" aria-labelledby="email-tab" hidden>
               <section
                 class="panel account-panel"
                 aria-labelledby="account-title"
@@ -91,8 +121,8 @@
                 <div class="panel-heading">
                   <span class="step-number">01</span>
                   <div>
-                    <h2 id="account-title">发送邮箱</h2>
-                    <p>专属 Agent 的通信入口，负责发送消息与接收回复。</p>
+                    <h2 id="account-title">备用发送邮箱</h2>
+                    <p>微信不可用时，通过这个邮箱发送消息与接收回复。</p>
                   </div>
                   <span class="heading-icon" data-icon="mail"></span>
                 </div>
@@ -365,6 +395,7 @@
                 </button>
               </div>
             </form>
+            </div>
             <aside class="setup-aside" aria-label="连接与测试">
               <section class="panel journey-panel">
                 <div class="compact-heading">
@@ -375,8 +406,8 @@
                   <li id="step-mail">
                     <span class="journey-marker">1</span>
                     <div>
-                      <strong>连接邮箱</strong>
-                      <p>保存发件与收件设置</p>
+                      <strong>连接通信方式</strong>
+                      <p>扫码登录微信，或保存邮箱</p>
                     </div>
                   </li>
                   <li id="step-agent">
@@ -390,7 +421,7 @@
                     <span class="journey-marker">3</span>
                     <div>
                       <strong>发起一次对话</strong>
-                      <p>收到邮件，回复，即刻连通</p>
+                      <p>收到消息，回复，即刻连通</p>
                     </div>
                   </li>
                 </ol>
@@ -427,13 +458,13 @@
                   <h2 id="test-title">检查是否一切就绪</h2>
                   <span data-icon="activity"></span>
                 </div>
-                <p>保存配置后，验证邮箱连接或发送一封需要回复的测试邮件。</p>
+                <p>检查连接，再发送一条需要回复的消息，确认双向通信。</p><div class="field test-channel-field"><label for="test-channel">测试方式</label><select id="test-channel"><option value="auto">自动选择 · 微信优先</option><option value="wechat">仅测试微信</option><option value="email">仅测试邮箱</option></select></div>
                 <button
                   class="button secondary full-width"
                   type="button"
                   id="test-connection"
                 >
-                  <span data-icon="plug"></span>检查邮箱连接</button
+                  <span data-icon="plug"></span>检查连接</button
                 ><button
                   class="button subtle full-width"
                   type="button"
@@ -484,8 +515,8 @@
           <footer class="page-footer">
             <span
               ><span data-icon="shield"></span>本机服务 · 配置持久保存 ·
-              仅与所配置邮箱通信</span
-            ><span>EmailCall / 为异步协作而生</span>
+              仅与指定收件人通信</span
+            ><span>agentCall / 为异步协作而生</span>
           </footer>
         </section>
         <section

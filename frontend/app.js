@@ -51,6 +51,10 @@ const paths = {
   key: '<circle cx="8" cy="8" r="5"/><path d="m11.5 11.5 9 9M16 16l3-3m0 6 3-3"/>',
   robot:
     '<rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4m-2-4h4M8 12h.01M16 12h.01M9 17h6M1 12v5m22-5v5"/>',
+  wechat:
+    '<path d="M15.5 10.5c0-4-3-7-7-7s-7 2.7-7 6c0 2 1 3.6 3 4.8L4 17l3-1.5h1.5M22.5 15c0-3-3-5.5-6.5-5.5S9.5 12 9.5 15s3 5.5 6.5 5.5h1.5L21 22l-.5-3c1.3-1 2-2.4 2-4Z"/><path d="M6 8.5h.01M11 8.5h.01M13.5 14.5h.01M18.5 14.5h.01"/>',
+  qr: '<path d="M3 3h6v6H3zm12 0h6v6h-6zM3 15h6v6H3zm12 0h3v3h3v3h-6zm6-3v3M12 3v3m0 3v3H9m-6 0h3m6 3v6m3-9h3"/>',
+  logout: '<path d="M9 4H4v16h5m6-13 5 5-5 5m-7-5h12"/>',
 };
 const icon = (name) =>
   `<span data-icon="${name}"><svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.info}</svg></span>`;
@@ -71,14 +75,14 @@ const escapeHTML = (value = "") =>
 const storage = {
   get(key) {
     try {
-      return localStorage.getItem(`emailcall.${key}`);
+      return localStorage.getItem(`agentcall.${key}`) ?? localStorage.getItem(`emailcall.${key}`);
     } catch {
       return null;
     }
   },
   set(key, value) {
     try {
-      localStorage.setItem(`emailcall.${key}`, value);
+      localStorage.setItem(`agentcall.${key}`, value);
     } catch {
       /* Private browsing can disable storage. */
     }
@@ -174,6 +178,19 @@ const state = {
   lastHealth: 0,
   refreshing: false,
   sessionPromise: null,
+  configChannel: storage.get("config-channel") || "wechat",
+  wechat: null,
+  wechatStatus: null,
+  wechatDirty: false,
+  wechatEditVersion: 0,
+  contacts: [],
+  contactsLoaded: false,
+  selectedContact: null,
+  wechatContactDirty: false,
+  contactSearchVersion: 0,
+  wechatRefreshing: false,
+  wechatSignature: "",
+  wechatConfigSignature: "",
 };
 const statusNames = {
   queued: "等待发送",
@@ -274,7 +291,7 @@ async function api(path, options = {}, recoveredSession = false) {
   } catch {
     setConnection(false);
     throw new Error(
-      "无法连接本地服务。请确认 EmailCall 容器已启动，然后重试。",
+      "无法连接本地服务。请确认 agentCall 容器已启动，然后重试。",
     );
   }
   if (response.status === 401 && !recoveredSession) {
@@ -329,7 +346,7 @@ function setConnection(online, service = {}) {
   $("#connection-banner").hidden = online && !pollError;
   if (!online)
     $("#connection-message").textContent =
-      "暂时无法连接服务，请确认 EmailCall 容器正在运行。";
+      "暂时无法连接服务，请确认 agentCall 容器正在运行。";
   else if (pollError)
     $("#connection-message").textContent =
       `收件检查遇到问题：${pollError.message}${pollError.hint ? ` ${pollError.hint}` : ""}`;
@@ -381,6 +398,7 @@ function applyConfig(data) {
     });
   }
   state.config = data.config;
+  if (data.wechat) applyWechat(data.wechat);
   const config = state.config || {};
   applyProvider(config.provider || "icloud", false);
   [
@@ -409,6 +427,7 @@ function applyConfig(data) {
   $("#save-status").innerHTML = `${icon("lock")}配置与记录保存在本机`;
   setConnection(true, data.service);
   updateProgress();
+  updateChannelLabels();
 }
 function markDirty() {
   state.dirty = true;
@@ -416,30 +435,33 @@ function markDirty() {
   $("#save-status").className = "dirty";
   $("#save-status").innerHTML = `${icon("info")}有尚未保存的更改`;
 }
-function hasSavedConfig() {
-  if (state.dirty) {
-    toast("请先保存更改，再使用当前邮箱设置。", true);
-    $("#save-config").focus();
+function emailConfigured(config = state.config) {
+  return Boolean(config?.email && config?.target_email && config?.password_set);
+}
+function wechatConfigured(config = state.wechat) {
+  return Boolean(config?.enabled && config?.target_contact_id);
+}
+function testChannel() {
+  return $("#test-channel").value || "auto";
+}
+function hasSavedConfig(channel = testChannel(), connectionOnly = false) {
+  if ((channel !== "wechat" && state.dirty) || (channel !== "email" && state.wechatDirty)) {
+    toast("请先保存通信配置中的更改。", true);
+    $(state.wechatDirty ? "#save-wechat" : "#save-config").focus();
     return false;
   }
-  if (
-    !state.config?.email ||
-    !state.config?.target_email ||
-    !state.config?.password_set
-  ) {
-    toast("请先填写并保存发件邮箱、应用专用密码和目标邮箱。", true);
-    $("#email").focus();
+  // Diagnostics must explain and persist missing login/recipient errors too.
+  if (connectionOnly && channel === "wechat") return true;
+  const ready = channel === "wechat" ? wechatConfigured() : channel === "email" ? emailConfigured() : wechatConfigured() || emailConfigured();
+  if (!ready) {
+    toast(channel === "wechat" ? "请先启用微信、选择联系人并保存配置。" : channel === "email" ? "请先填写并保存发件邮箱、应用专用密码和目标邮箱。" : "请先保存微信联系人或完整的邮箱配置。", true);
     return false;
   }
   return true;
 }
 function updateProgress() {
   const completed = [
-    Boolean(
-      state.config?.email &&
-        state.config?.password_set &&
-        state.config?.target_email,
-    ),
+    emailConfigured() || wechatConfigured(),
     storage.get("exported") === "yes",
     storage.get("tested") === "yes",
   ];
@@ -506,7 +528,7 @@ $("#config-form").addEventListener("submit", (event) => {
       password_set: Boolean(data.password || state.config?.password_set),
     };
     delete candidate.password;
-    if (configFingerprint(candidate) !== state.pendingTest.config) {
+    if (testFingerprint(candidate, state.wechat, state.pendingTest.body.channel || "auto") !== state.pendingTest.config) {
       toast(
         "上次测试的创建结果尚未确认。请先点击「重试这次测试」，确认后再保存新配置；当前修改会保留。",
         true,
@@ -535,6 +557,192 @@ $("#config-form").addEventListener("submit", (event) => {
   });
 });
 
+function selectConfigChannel(channel, focus = false) {
+  state.configChannel = channel === "email" ? "email" : "wechat";
+  storage.set("config-channel", state.configChannel);
+  $("#wechat-config-panel").hidden = state.configChannel !== "wechat";
+  $("#config-form").hidden = state.configChannel !== "email";
+  $$("[data-channel-tab]").forEach((button) => {
+    const selected = button.dataset.channelTab === state.configChannel;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-selected", String(selected));
+    button.setAttribute("tabindex", selected ? "0" : "-1");
+    if (selected && focus) button.focus();
+  });
+}
+$$("[data-channel-tab]").forEach((button) => {
+  button.addEventListener("click", () => selectConfigChannel(button.dataset.channelTab));
+  button.addEventListener("keydown", (event) => {
+    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      selectConfigChannel(event.key === "Home" ? "wechat" : event.key === "End" ? "email" : state.configChannel === "wechat" ? "email" : "wechat", true);
+    }
+  });
+});
+function updateChannelLabels() {
+  $("#email-tab-status").textContent = emailConfigured() ? "已配置" : "未配置";
+  $("#wechat-tab-status").textContent = state.wechatStatus?.available ? "已就绪" : state.wechatStatus?.logged_in ? "已登录" : state.wechat?.enabled ? "待登录" : "未启用";
+}
+function markWechatDirty() {
+  state.wechatDirty = true;
+  state.wechatEditVersion += 1;
+  $("#wechat-save-status").className = "dirty";
+  $("#wechat-save-status").innerHTML = `${icon("info")}有尚未保存的更改`;
+}
+function updateWechatMode() {
+  const external = $("#wechat-mode").value === "external";
+  $("#wechat-external-settings").hidden = !external;
+  $("#wechat-endpoint").required = external;
+}
+function applyWechat(data, preserveEdits = true) {
+  if (data.config) state.wechat = data.config;
+  const configSignature = JSON.stringify(state.wechat || {});
+  if (!preserveEdits || (!state.wechatDirty && configSignature !== state.wechatConfigSignature)) {
+    const config = state.wechat || {};
+    state.wechatConfigSignature = configSignature;
+    $("#wechat-enabled").checked = Boolean(config.enabled);
+    $("#wechat-mode").value = config.mode || "local";
+    $("#wechat-endpoint").value = config.service_endpoint || "";
+    $("#wechat-token").value = "";
+    $("#wechat-token").placeholder = config.service_token_set ? "已保存 · 留空保留现有令牌" : "输入外部服务的访问令牌";
+    $("#wechat-token-state").textContent = config.service_token_set ? "已保存" : "";
+    state.selectedContact = config.target_contact_id ? { id: config.target_contact_id, name: config.target_contact_name || config.target_contact_id } : null;
+    state.wechatContactDirty = false;
+    state.wechatDirty = false;
+    $("#wechat-save-status").className = "";
+    $("#wechat-save-status").innerHTML = `${icon("lock")}配置与登录会话持久保存`;
+    updateWechatMode();
+    renderContacts();
+  }
+  if (data.status) renderWechatStatus(data.status);
+  updateChannelLabels();
+  updateProgress();
+}
+function renderWechatStatus(status) {
+  state.wechatStatus = status;
+  const signature = JSON.stringify([status.state, status.logged_in, status.available, status.account, status.qr_image, status.qr_status, status.error]);
+  if (signature === state.wechatSignature) return;
+  state.wechatSignature = signature;
+  const labels = { disabled: "微信未启用", stopped: "微信已停止", starting: "正在启动微信连接", connecting: "正在连接微信服务", scanning: "等待扫码登录", scan: "等待扫码登录", waiting_scan: "等待扫码登录", awaiting_scan: "等待扫码登录", waiting_login: "等待扫码登录", logged_out: "微信当前未登录", error: "微信连接遇到问题", unavailable: "微信暂时不可用" };
+  const loggedIn = Boolean(status.logged_in);
+  $("#wechat-status-title").textContent = loggedIn ? `已登录${status.account?.name ? ` · ${status.account.name}` : ""}` : labels[status.state] || "微信尚未登录";
+  $("#wechat-status-description").textContent = status.available ? "微信当前可用，将优先用于下一次 Agent 消息。" : loggedIn ? "选择并保存一位目标联系人后，即可发送消息。" : "微信不可用时，Agent 会自动使用已配置的邮箱。";
+  $(".status-dot", $("#wechat-status")).className = `status-dot ${loggedIn ? "online" : status.error ? "error" : ""}`;
+  $("#wechat-error").hidden = !status.error;
+  $("#wechat-error").innerHTML = status.error ? `<strong>${escapeHTML(status.error.message || "微信连接失败")}</strong>${status.error.hint ? `<p>${escapeHTML(status.error.hint)}</p>` : ""}${status.error.code ? `<code>${escapeHTML(status.error.code)}</code>` : ""}` : "";
+  const qr = status.qr_image;
+  const safeImage = typeof qr === "string" && /^data:image\/(?:svg\+xml|png);base64,[A-Za-z0-9+/=\s]+$/.test(qr);
+  $("#wechat-qr").innerHTML = loggedIn ? `<div class="qr-placeholder connected">${icon("check")}<span>微信已登录</span></div>` : safeImage ? `<img src="${escapeHTML(qr)}" alt="使用微信扫描此二维码并在手机上确认登录"/>` : `<div class="qr-placeholder">${icon("qr")}<span>${status.state === "starting" ? "正在获取登录二维码…" : "登录二维码会显示在这里"}</span></div>`;
+  $("#wechat-login-title").textContent = loggedIn ? "连接已经建立" : safeImage ? "用微信扫一扫" : "从一次扫码开始";
+  $("#wechat-login-help").textContent = loggedIn ? "登录会话保存在本机。断开并停用后，重新启用可恢复仍有效的会话；更换微信账号后需重新选择联系人。" : safeImage ? "请使用微信扫描二维码并在手机确认。二维码过期时，点击刷新二维码。" : "点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新选择目标联系人。";
+  $("#wechat-login").hidden = loggedIn;
+  if (!$("#wechat-login").disabled) $("#wechat-login").innerHTML = `${icon("qr")}${safeImage ? "刷新二维码" : "扫码登录"}`;
+  $("#wechat-logout").hidden = !loggedIn;
+  $("#wechat-load-contacts").disabled = !loggedIn;
+  updateChannelLabels();
+}
+async function refreshWechat(probe = false) {
+  if (state.wechatRefreshing) return;
+  state.wechatRefreshing = true;
+  try { applyWechat(await api(`/api/wechat${probe ? "?probe=1" : ""}`)); }
+  finally { state.wechatRefreshing = false; }
+}
+function wechatFormData() {
+  return {
+    enabled: $("#wechat-enabled").checked,
+    mode: $("#wechat-mode").value || "local",
+    service_endpoint: $("#wechat-endpoint").value.trim(),
+    service_token: $("#wechat-token").value,
+    ...(state.wechatContactDirty ? {
+      target_contact_id: state.selectedContact?.id || "",
+      target_contact_name: state.selectedContact?.alias || state.selectedContact?.name || "",
+    } : {}),
+  };
+}
+async function saveWechatConfig() {
+  if (state.pendingTest && (state.pendingTest.body.channel || "auto") !== "email")
+    throw new Error("上次测试的创建结果尚未确认。请先点击「重试这次测试」，再保存微信配置。");
+  const submittedVersion = state.wechatEditVersion;
+  const result = await api("/api/wechat", { method: "PUT", body: wechatFormData() });
+  applyWechat(result, state.wechatEditVersion !== submittedVersion);
+  storage.set("tested", "no");
+  updateProgress();
+  return result;
+}
+$("#wechat-config-panel").addEventListener("input", (event) => {
+  if (event.target.id !== "wechat-contact-search") markWechatDirty();
+});
+$("#wechat-config-panel").addEventListener("change", (event) => {
+  if (event.target.id !== "wechat-contact-search") markWechatDirty();
+});
+$("#wechat-mode").addEventListener("change", updateWechatMode);
+$("#wechat-config-panel").addEventListener("submit", (event) => {
+  event.preventDefault();
+  withBusy($("#save-wechat"), "正在保存", async () => {
+    await saveWechatConfig();
+    toast("微信配置已保存。");
+  });
+});
+$("#wechat-login").addEventListener("click", async () => {
+  await withBusy($("#wechat-login"), "正在获取二维码", async () => {
+    if (!$("#wechat-enabled").checked) { $("#wechat-enabled").checked = true; markWechatDirty(); }
+    if (state.wechatDirty || !state.wechat?.enabled) await saveWechatConfig();
+    applyWechat(await api("/api/wechat/login", { method: "POST", body: {} }));
+    await refreshWechat();
+  });
+  state.wechatSignature = "";
+  if (state.wechatStatus) renderWechatStatus(state.wechatStatus);
+});
+$("#wechat-refresh").addEventListener("click", () => withBusy($("#wechat-refresh"), "检查中", () => refreshWechat(true)));
+$("#wechat-logout").addEventListener("click", () => withBusy($("#wechat-logout"), "正在断开并停用", async () => {
+  applyWechat(await api("/api/wechat/logout", { method: "POST", body: {} }));
+  state.contacts = [];
+  state.contactsLoaded = false;
+  renderContacts();
+  await refreshWechat();
+  toast("已断开并停用微信，后续自动发送将使用备用邮箱。有效登录会话仍保留，重新启用时可恢复。");
+}));
+function renderContacts() {
+  const selected = state.selectedContact;
+  $("#wechat-selected-contact").hidden = !selected;
+  $("#wechat-selected-contact").innerHTML = selected ? `<span class="contact-avatar">${escapeHTML((selected.alias || selected.name || "微").slice(0, 1))}</span><span class="contact-name">${escapeHTML(selected.alias || selected.name || selected.id)}<small>当前选择的目标联系人</small></span><button type="button" class="text-button clear-contact" aria-label="清除目标联系人" data-clear-contact>${icon("x")}清除</button>` : "";
+  $("#wechat-contacts").innerHTML = state.contacts.length ? state.contacts.map((contact) => `<button class="contact-option${selected?.id === contact.id ? " selected" : ""}" type="button" data-contact-id="${escapeHTML(contact.id)}" aria-pressed="${selected?.id === contact.id}"><span class="contact-avatar">${escapeHTML((contact.alias || contact.name || "微").slice(0, 1))}</span><span class="contact-name">${escapeHTML(contact.alias || contact.name || contact.id)}${contact.alias && contact.name ? `<small>${escapeHTML(contact.name)}</small>` : ""}<small>${escapeHTML(contact.id)}</small></span>${selected?.id === contact.id ? icon("check") : ""}</button>`).join("") : `<p class="contact-empty">${state.contactsLoaded ? "没有找到联系人。试试其他姓名，或确认已在微信添加对方。" : "登录微信后，获取并选择联系人。"}</p>`;
+}
+async function loadContacts() {
+  const version = ++state.contactSearchVersion;
+  const query = $("#wechat-contact-search").value.trim();
+  $("#wechat-contacts").setAttribute("aria-busy", "true");
+  try {
+    const result = await api(`/api/wechat/contacts?q=${encodeURIComponent(query)}`);
+    if (version !== state.contactSearchVersion) return;
+    state.contacts = result.items || [];
+    state.contactsLoaded = true;
+    renderContacts();
+  } catch (error) {
+    if (version === state.contactSearchVersion) $("#wechat-contacts").innerHTML = `<p class="contact-empty error-text">${escapeHTML(errorMessage(error))}</p>`;
+    throw error;
+  } finally { if (version === state.contactSearchVersion) $("#wechat-contacts").removeAttribute("aria-busy"); }
+}
+$("#wechat-load-contacts").addEventListener("click", () => withBusy($("#wechat-load-contacts"), "获取中", loadContacts));
+let contactSearchTimer;
+$("#wechat-contact-search").addEventListener("input", () => {
+  clearTimeout(contactSearchTimer);
+  if (state.wechatStatus?.logged_in) contactSearchTimer = setTimeout(() => loadContacts().catch(() => {}), 300);
+});
+$("#wechat-contacts").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-contact-id]");
+  const contact = button && state.contacts.find((item) => item.id === button.dataset.contactId);
+  if (contact) { state.selectedContact = contact; state.wechatContactDirty = true; markWechatDirty(); renderContacts(); }
+});
+$("#wechat-selected-contact").addEventListener("click", (event) => {
+  if (event.target.closest("[data-clear-contact]")) {
+    state.selectedContact = null;
+    state.wechatContactDirty = true;
+    markWechatDirty();
+    renderContacts();
+  }
+});
+
 function showPage(page) {
   state.page = page === "records" ? "records" : "config";
   $("#config-page").hidden = state.page !== "config";
@@ -545,29 +753,30 @@ function showPage(page) {
     if (active) item.setAttribute("aria-current", "page");
     else item.removeAttribute("aria-current");
   });
-  document.title = `${state.page === "config" ? "配置" : "记录"} · EmailCall`;
+  document.title = `${state.page === "config" ? "配置" : "记录"} · agentCall`;
   if (state.page === "records" && state.csrf)
     loadRecords().catch((error) => showRecordsError(error));
 }
 addEventListener("hashchange", () => showPage(location.hash.slice(1)));
 showPage(location.hash.slice(1));
 addEventListener("beforeunload", (event) => {
-  if (state.dirty) {
+  if (state.dirty || state.wechatDirty) {
     event.preventDefault();
     event.returnValue = "";
   }
 });
 
 $("#test-connection").addEventListener("click", () => {
-  if (!hasSavedConfig()) return;
-  withBusy($("#test-connection"), "正在检查邮箱连接", async () => {
+  const channel = testChannel();
+  if (!hasSavedConfig(channel, true)) return;
+  return withBusy($("#test-connection"), "正在检查连接", async () => {
     $("#test-results").hidden = false;
     $("#test-results").textContent =
-      "正在分别验证 SMTP 发信与 IMAP 收信，请稍候…";
+      channel === "wechat" ? "正在检查微信服务、登录状态和目标联系人…" : channel === "email" ? "正在分别验证 SMTP 发信与 IMAP 收信，请稍候…" : "正在检查微信优先通道与可用的邮箱连接…";
     try {
-      const result = await api("/api/config/test", {
+      const result = await api(channel === "wechat" ? "/api/wechat/test" : "/api/config/test", {
         method: "POST",
-        body: {},
+        body: channel === "wechat" ? {} : { channel },
       });
       $("#test-results").innerHTML = (result.checks || [])
         .map(
@@ -577,8 +786,8 @@ $("#test-connection").addEventListener("click", () => {
         .join("");
       toast(
         result.ok
-          ? "发信与收信连接正常，可以开始对话测试。"
-          : "邮箱连接未全部通过，请查看检查结果。",
+          ? "连接检查通过，可以开始对话测试。"
+          : "连接检查未通过，请查看检查结果。",
         !result.ok,
       );
     } catch (error) {
@@ -594,6 +803,10 @@ function configFingerprint(config) {
       .sort()
       .map((name) => [name, config[name]]),
   );
+}
+function testFingerprint(config, wechat, channel = "auto") {
+  if (channel === "email" || !wechat) return configFingerprint(config);
+  return configFingerprint({ ...(channel === "auto" ? { email: config } : {}), wechat });
 }
 function savePendingTest(pending) {
   state.pendingTest = pending;
@@ -625,12 +838,13 @@ $("#send-test").addEventListener("click", async () => {
       if (!state.pendingTest) {
         savePendingTest({
           key: `web-test-${crypto.randomUUID()}`,
-          config: configFingerprint(state.config),
+          config: testFingerprint(state.config, state.wechat, testChannel()),
           body: {
-            subject: "EmailCall 连通性测试 · 请回复这封邮件",
-            body: "你好！这是来自 EmailCall 的对话测试。\n\n请在 5 分钟内直接回复这封邮件，可以写下「已收到，连接成功」，或任何你想说的话。收到回复后，EmailCall 会在网页中显示回复原文。\n\n安装 Skill 后，你也可以让 Agent 发起同样的测试，并请它复述你的回复。",
-            agent_name: "EmailCall 连通性测试",
+            subject: "agentCall 连通性测试 · 请回复这条消息",
+            body: "你好！这是来自 agentCall 的对话测试。\n\n请在 5 分钟内回复，可以写下「已收到，连接成功」，或任何你想说的话。收到回复后，agentCall 会在网页中显示回复原文。\n\n使用微信时，请按消息末尾的说明回复；使用邮箱时，请直接回复原邮件。安装 Skill 后，你也可以让 Agent 发起测试并复述你的回复。",
+            agent_name: "agentCall 连通性测试",
             timeout_seconds: 300,
+            channel: testChannel(),
           },
         });
       }
@@ -638,9 +852,9 @@ $("#send-test").addEventListener("click", async () => {
       try {
         if (retrying) {
           const current = await api("/api/config");
-          if (configFingerprint(current.config) !== pending.config) {
+          if (testFingerprint(current.config, current.wechat?.config, pending.body.channel || "auto") !== pending.config) {
             const error = new Error(
-              "已保存的邮箱配置已发生变化。请恢复原邮箱配置后重试；原请求仍保留，已暂停向新邮箱重发。",
+              "已保存的通信配置已发生变化。请恢复原配置后重试；原请求仍保留，已暂停向新收件人重发。",
             );
             error.configChanged = true;
             throw error;
@@ -658,7 +872,7 @@ $("#send-test").addEventListener("click", async () => {
         toast(
           retrying
             ? "已确认原测试请求，当前状态已同步。"
-            : "测试请求已创建，发出后请在 5 分钟内回复邮件。",
+            : "测试请求已创建，发出后请在 5 分钟内回复消息。",
         );
       } catch (error) {
         if ([400, 409, 413, 415, 422].includes(error.status)) {
@@ -698,14 +912,15 @@ function statusBadge(record) {
     ? `<span class="status-group">${badge}<span class="status-pill ignored-reply">${icon("alert")}<span>回复未采纳</span></span></span>`
     : badge;
 }
-function waitingMessage(deadline) {
+function waitingMessage(deadline, channel = "email") {
+  const instruction = channel === "wechat" ? "请在微信中按测试消息的说明回复。" : "请直接回复收到的邮件。";
   const remaining = Math.ceil((Date.parse(deadline) - Date.now()) / 1000);
-  if (!Number.isFinite(remaining)) return "请直接回复收到的邮件。";
+  if (!Number.isFinite(remaining)) return instruction;
   if (remaining < -30)
     return "回复截止时间已过，正在等待服务同步最终结果。若长时间未更新，请检查本地服务连接。";
   if (remaining <= 0)
-    return "回复截止时间已到，正在核对最后收到的邮件（最多 30 秒），随后同步最终结果。";
-  return `请直接回复收到的邮件。剩余 ${Math.floor(remaining / 60)} 分 ${remaining % 60} 秒，截止 ${formatDate(deadline)}。`;
+    return "回复截止时间已到，正在核对最后收到的消息（最多 30 秒），随后同步最终结果。";
+  return `${instruction}剩余 ${Math.floor(remaining / 60)} 分 ${remaining % 60} 秒，截止 ${formatDate(deadline)}。`;
 }
 function updateCountdowns() {
   $$("[data-wait-status]").forEach((element) => {
@@ -716,7 +931,7 @@ function updateCountdowns() {
     if (element.textContent !== label) element.textContent = label;
   });
   $$("[data-wait-message]").forEach((element) => {
-    const message = `${element.dataset.waitMessagePrefix || ""}${waitingMessage(element.dataset.waitMessage)}`;
+    const message = `${element.dataset.waitMessagePrefix || ""}${waitingMessage(element.dataset.waitMessage, element.dataset.waitChannel)}`;
     if (element.textContent !== message) element.textContent = message;
   });
 }
@@ -729,11 +944,11 @@ function renderLiveTest(record) {
   container.hidden = false;
   const ignoredReply = latestIgnoredReply(record);
   const ignoredMessage = ignoredReply
-    ? `已收到回复，但未采纳：${ignoredReply.ignored_reason?.message || "该邮件未通过回复校验。"}\n${ignoredReply.ignored_reason?.hint || `请使用配置的目标邮箱 ${record.target_email || ""} 直接回复测试邮件。`}\n`
+    ? `已收到回复，但未采纳：${ignoredReply.ignored_reason?.message || "该消息未通过回复校验。"}\n${ignoredReply.ignored_reason?.hint || (record.channel === "wechat" ? "请使用所选目标联系人的微信账号回复。" : `请使用配置的目标邮箱 ${record.target_email || ""} 直接回复测试邮件。`)}\n`
     : "";
-  let message = "测试邮件正在发送，请稍候。";
+  let message = "测试消息正在发送，请稍候。";
   if (record.status === "waiting")
-    message = `${ignoredMessage}${waitingMessage(record.deadline_at)}`;
+    message = `${ignoredMessage}${waitingMessage(record.deadline_at, record.channel)}`;
   if (record.status === "replied") {
     message = `已收到你的回复：\n${record.reply?.body || record.replies?.find((reply) => !reply.late)?.body || "（空回复）"}`;
     storage.set("tested", "yes");
@@ -758,11 +973,13 @@ function renderLiveTest(record) {
   if (record.status === "waiting" && record.deadline_at) {
     paragraph.dataset.waitMessage = record.deadline_at;
     paragraph.dataset.waitMessagePrefix = ignoredMessage;
+    paragraph.dataset.waitChannel = record.channel || "email";
     paragraph.setAttribute("role", "timer");
     paragraph.setAttribute("aria-live", "off");
   } else {
     paragraph.removeAttribute("data-wait-message");
     paragraph.removeAttribute("data-wait-message-prefix");
+    paragraph.removeAttribute("data-wait-channel");
     paragraph.removeAttribute("role");
     paragraph.removeAttribute("aria-live");
   }
@@ -774,13 +991,13 @@ $("#live-test").addEventListener("click", (event) => {
 });
 
 $("#export-skill").addEventListener("click", () => {
-  if (!hasSavedConfig()) return;
+  if (!hasSavedConfig("auto")) return;
   withBusy($("#export-skill"), "正在打包 Skill", async () => {
     const blob = await api("/api/skill/export");
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "emailcall-skill.zip";
+    link.download = "agentcall-skill.zip";
     document.body.append(link);
     link.click();
     link.remove();
@@ -791,7 +1008,7 @@ $("#export-skill").addEventListener("click", () => {
       const guide = document.createElement("div");
       guide.className = "install-guide";
       guide.innerHTML =
-        "<strong>接下来，把 Skill 安装到 Agent</strong><p>解压 ZIP 后，在解压所在目录运行对应命令：</p><code>python3 emailcall/install.py codex\npython3 emailcall/install.py claude</code><p>同时安装到两个 Agent，可运行 <code>python3 emailcall/install.py both</code>安装器会同步配置任务完成与决策时的调用规则。</p><p>随后开启新的 Agent 会话，说：「使用 EmailCall 做一次连通性测试，等待并复述我的邮件回复。」</p>";
+        "<strong>接下来，把 Skill 安装到 Agent</strong><p>解压 ZIP 后，在解压所在目录运行对应命令：</p><code>python3 agentcall/install.py codex\npython3 agentcall/install.py claude</code><p>同时安装到两个 Agent，可运行 <code>python3 agentcall/install.py both</code>安装器会同步配置任务完成与决策时的调用规则。</p><p>随后开启新的 Agent 会话，说：「使用 agentCall 做一次连通性测试，等待并复述我的回复。」</p>";
       $(".skill-panel").after(guide);
     }
     toast("Skill 已导出，安装方式见下载包中的 README。");
@@ -898,7 +1115,7 @@ function renderRecords() {
   );
   if (!state.records.length)
     $("#records-list").innerHTML =
-      `<div class="empty-state"><div class="empty-art">${icon(filtered ? "search" : "inbox")}</div><h3>${filtered ? "没有找到匹配的记录" : "让第一封邮件，开启连接"}</h3><p>${filtered ? "换一个关键词，或清除筛选条件查看全部消息。" : "Agent 的通知、你的回复和连接检查都会出现在这里。先连接邮箱，再发起一次对话吧。"}</p>${filtered ? '<button class="button secondary" id="clear-filters" type="button">清除筛选</button>' : '<a class="button secondary" href="#config">配置邮箱与测试连接</a>'}</div>`;
+      `<div class="empty-state"><div class="empty-art">${icon(filtered ? "search" : "inbox")}</div><h3>${filtered ? "没有找到匹配的记录" : "让第一条消息，开启连接"}</h3><p>${filtered ? "换一个关键词，或清除筛选条件查看全部消息。" : "Agent 的通知、你的回复和连接检查都会出现在这里。先连接微信或邮箱，再发起一次对话吧。"}</p>${filtered ? '<button class="button secondary" id="clear-filters" type="button">清除筛选</button>' : '<a class="button secondary" href="#config">配置通信方式与测试连接</a>'}</div>`;
   else
     $("#records-list").innerHTML = state.records
       .map((record) => {
@@ -915,7 +1132,7 @@ function renderRecords() {
           : ignoredReply && !record.reply && record.status !== "replied"
             ? " warning-text"
             : "";
-        return `<button class="record-row" type="button" data-record-id="${escapeHTML(record.id)}" aria-label="查看记录：${escapeHTML(record.subject || "无主题")}，${escapeHTML(statusNames[record.status] || record.status)}${ignoredReply ? "，回复未采纳" : ""}"><span class="record-main"><span class="record-subject">${escapeHTML(record.subject || "无主题")}</span><span class="record-byline">${icon(record.kind === "diagnostic" ? "activity" : "robot")}${escapeHTML(record.agent_name || "Agent")}${record.replies?.some((reply) => reply.late) ? '<span class="late-badge">有晚到回复</span>' : ""}</span><span class="record-preview${previewClass}">${escapeHTML(preview)}</span></span><span class="record-kind">${escapeHTML(kindNames[record.kind] || record.kind)}</span>${statusBadge(record)}<span class="record-time">${escapeHTML(formatDate(record.created_at))}<span>${escapeHTML(new Date(record.created_at).getFullYear())}</span></span><span class="row-chevron">${icon("chevron-right")}</span></button>`;
+        return `<button class="record-row" type="button" data-record-id="${escapeHTML(record.id)}" aria-label="查看记录：${escapeHTML(record.subject || "无主题")}，${escapeHTML(statusNames[record.status] || record.status)}${ignoredReply ? "，回复未采纳" : ""}"><span class="record-main"><span class="record-subject">${escapeHTML(record.subject || "无主题")}</span><span class="record-byline">${icon(record.kind === "diagnostic" ? "activity" : "robot")}${escapeHTML(record.agent_name || "Agent")}${channelBadge(record)}${record.fallback_reason ? '<span class="late-badge">已切换邮箱</span>' : ""}${record.replies?.some((reply) => reply.late) ? '<span class="late-badge">有晚到回复</span>' : ""}</span><span class="record-preview${previewClass}">${escapeHTML(preview)}</span></span><span class="record-kind">${escapeHTML(kindNames[record.kind] || record.kind)}</span>${statusBadge(record)}<span class="record-time">${escapeHTML(formatDate(record.created_at))}<span>${escapeHTML(new Date(record.created_at).getFullYear())}</span></span><span class="row-chevron">${icon("chevron-right")}</span></button>`;
       })
       .join("");
   $("#record-count").textContent = state.total
@@ -993,14 +1210,23 @@ async function openRecord(id) {
 $("#record-dialog").addEventListener("close", () => {
   state.detailId = null;
 });
+function channelBadge(record) {
+  const channel = record.channel === "wechat" ? "wechat" : "email";
+  return `<span class="channel-badge ${channel}">${channel === "wechat" ? "微信" : "邮箱"}</span>`;
+}
+function renderFallback(record) {
+  if (!record.fallback_reason) return "";
+  const reason = record.fallback_reason;
+  return `<div class="fallback-box"><strong>微信暂不可用，已改用邮箱发送</strong><p>${escapeHTML(typeof reason === "string" ? reason : reason.message || "微信连接暂不可用。")}</p>${reason.hint ? `<p>${escapeHTML(reason.hint)}</p>` : ""}</div>`;
+}
 function renderIgnoredReplies(record) {
   if (!record.ignored_replies?.length) return "";
   return `<section class="detail-section ignored-replies-section">
     <h3>${icon("alert")}未采纳的回复 · ${record.ignored_replies.length}</h3>
-    <p class="ignored-reply-note">以下邮件已保存，但未计入有效回复。请使用配置的目标邮箱 ${escapeHTML(record.target_email || "")} 直接回复原邮件。</p>
+    <p class="ignored-reply-note">以下消息已保存，但未计入有效回复。${record.channel === "wechat" ? "请使用所选目标联系人的微信账号回复。" : `请使用配置的目标邮箱 ${escapeHTML(record.target_email || "")} 直接回复原邮件。`}</p>
     ${record.ignored_replies.map((reply) => `<div class="reply-block ignored-reply-block">
-      <div class="reply-meta"><span>${escapeHTML(reply.from_email || "未知发件人")}</span><time datetime="${escapeHTML(reply.received_at)}">${escapeHTML(formatDate(reply.received_at, { year: "numeric", second: "2-digit" }))}</time></div>
-      <div class="ignored-reply-reason"><strong>${escapeHTML(reply.ignored_reason?.message || "该邮件未通过回复校验。")}</strong>${reply.ignored_reason?.hint ? `<p>${escapeHTML(reply.ignored_reason.hint)}</p>` : ""}${reply.ignored_reason?.code ? `<code>原因码：${escapeHTML(reply.ignored_reason.code)}</code>` : ""}</div>
+      <div class="reply-meta"><span>${escapeHTML(reply.from_name || reply.from_email || reply.from_contact_id || "未知发件人")}</span><time datetime="${escapeHTML(reply.received_at)}">${escapeHTML(formatDate(reply.received_at, { year: "numeric", second: "2-digit" }))}</time></div>
+      <div class="ignored-reply-reason"><strong>${escapeHTML(reply.ignored_reason?.message || "该消息未通过回复校验。")}</strong>${reply.ignored_reason?.hint ? `<p>${escapeHTML(reply.ignored_reason.hint)}</p>` : ""}${reply.ignored_reason?.code ? `<code>原因码：${escapeHTML(reply.ignored_reason.code)}</code>` : ""}</div>
       <pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre>
     </div>`).join("")}
   </section>`;
@@ -1018,7 +1244,8 @@ function renderDetail(record) {
       : [];
   const metadata = [
     ["发起 Agent", escapeHTML(record.agent_name || "Agent")],
-    ["目标邮箱", escapeHTML(record.target_email || "尚未配置")],
+    ["发送通道", channelBadge(record)],
+    [record.channel === "wechat" ? "目标联系人" : "目标邮箱", escapeHTML(record.recipient_label || record.target_email || record.target_contact_id || "尚未配置")],
     [
       "创建时间",
       escapeHTML(
@@ -1054,7 +1281,7 @@ function renderDetail(record) {
     ["请求编号", `<code>${escapeHTML(record.id)}</code>`],
   ];
   $("#record-detail").innerHTML =
-    `<div class="detail-overview">${statusBadge(record)}<span>${escapeHTML(kindNames[record.kind] || record.kind)}</span></div><dl class="detail-metadata">${metadata.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("")}</dl>${record.error ? `<section class="detail-section"><h3>${icon("alert")}发生的问题</h3><div class="error-box"><strong>${escapeHTML(record.error.message)}</strong>${record.error.hint ? `<p>${escapeHTML(record.error.hint)}</p>` : ""}<code>错误码：${escapeHTML(record.error.code)}</code></div></section>` : ""}${renderIgnoredReplies(record)}<section class="detail-section"><h3>${icon("mail")}发送的消息</h3><pre class="message-body">${escapeHTML(record.body || "（此请求没有正文）")}</pre></section>${replies.length ? `<section class="detail-section"><h3>${icon("message")}收到的回复 · ${replies.length}</h3>${replies.some((reply) => reply.late) ? '<p class="late-note">晚到的回复已保存，不会改变原请求的超时状态。</p>' : ""}${replies.map((reply) => `<div class="reply-block"><div class="reply-meta"><span>${escapeHTML(reply.from_email || record.target_email)}</span><span>${escapeHTML(formatDate(reply.received_at, { second: "2-digit" }))}</span>${reply.late ? '<span class="late-badge">超时后到达</span>' : ""}</div><pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre></div>`).join("")}</section>` : ""}${record.events?.length ? `<section class="detail-section"><h3>${icon("activity")}消息时间线</h3><ol class="timeline">${record.events.map((event) => `<li>${escapeHTML(event.message || event.type)}<time datetime="${escapeHTML(event.at)}">${escapeHTML(formatDate(event.at, { year: "numeric", second: "2-digit" }))}</time></li>`).join("")}</ol></section>` : ""}${["queued", "sending", "waiting"].includes(record.status) ? `<div class="detail-refresh">${icon("refresh")}状态每 5 秒自动更新</div>` : ""}`;
+    `<div class="detail-overview">${statusBadge(record)}<span>${escapeHTML(kindNames[record.kind] || record.kind)}</span></div><dl class="detail-metadata">${metadata.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("")}</dl>${record.error ? `<section class="detail-section"><h3>${icon("alert")}发生的问题</h3><div class="error-box"><strong>${escapeHTML(record.error.message)}</strong>${record.error.hint ? `<p>${escapeHTML(record.error.hint)}</p>` : ""}<code>错误码：${escapeHTML(record.error.code)}</code></div></section>` : ""}${renderFallback(record)}${renderIgnoredReplies(record)}<section class="detail-section"><h3>${icon(record.channel === "wechat" ? "wechat" : "mail")}发送的消息</h3><pre class="message-body">${escapeHTML(record.body || "（此请求没有正文）")}</pre></section>${replies.length ? `<section class="detail-section"><h3>${icon("message")}收到的回复 · ${replies.length}</h3>${replies.some((reply) => reply.late) ? '<p class="late-note">晚到的回复已保存，不会改变原请求的超时状态。</p>' : ""}${replies.map((reply) => `<div class="reply-block"><div class="reply-meta"><span>${escapeHTML(reply.from_name || reply.from_email || reply.from_contact_id || record.recipient_label || record.target_email)}</span><span>${escapeHTML(formatDate(reply.received_at, { second: "2-digit" }))}</span>${reply.late ? '<span class="late-badge">超时后到达</span>' : ""}</div><pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre></div>`).join("")}</section>` : ""}${record.events?.length ? `<section class="detail-section"><h3>${icon("activity")}消息时间线</h3><ol class="timeline">${record.events.map((event) => `<li>${escapeHTML(event.message || event.type)}<time datetime="${escapeHTML(event.at)}">${escapeHTML(formatDate(event.at, { year: "numeric", second: "2-digit" }))}</time></li>`).join("")}</ol></section>` : ""}${["queued", "sending", "waiting"].includes(record.status) ? `<div class="detail-refresh">${icon("refresh")}状态每 5 秒自动更新</div>` : ""}`;
 }
 
 async function connect() {
@@ -1123,6 +1350,7 @@ async function refresh() {
     state.refreshing = false;
   }
 }
+selectConfigChannel(state.configChannel);
 applyProvider("icloud", true);
 state.dirty = false;
 $("#save-status").className = "";
@@ -1131,6 +1359,7 @@ updateTestButton();
 if (state.pendingTest) renderPendingTest();
 connect();
 setInterval(refresh, 5000);
+setInterval(() => { if (!document.hidden && state.page === "config" && state.csrf) refreshWechat().catch(() => {}); }, 3000);
 setInterval(updateCountdowns, 1000);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refresh();
