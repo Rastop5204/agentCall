@@ -646,36 +646,19 @@ main {
 }
 
 .provider-symbol {
-  height: 25px;
-  font-size: 22px;
-  font-weight: 650;
-  letter-spacing: -0.08em;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
 }
 
 .provider-symbol svg {
-  height: 23px;
-  width: 23px;
+  height: 24px;
+  width: 24px;
 }
 
-.provider-symbol.icloud {
-  color: #5596c3;
-}
-
-.provider-symbol.gmail {
-  color: #cd6252;
-  font-weight: 650;
-}
-
-.provider-symbol.netease {
-  font-size: 16px;
-  color: #c15a53;
-  font-style: italic;
-  font-weight: 750;
-  letter-spacing: -0.07em;
-}
-
-.provider-symbol.qq {
-  color: #617f8a;
+.provider-logo {
+  object-fit: contain;
 }
 
 .field-grid {
@@ -2546,7 +2529,8 @@ dialog[open] {
     gap: 5px;
   }
   .provider-symbol {
-    height: 23px;
+    width: 28px;
+    height: 28px;
   }
   .provider-symbol svg {
     width: 21px;
