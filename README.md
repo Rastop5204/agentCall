@@ -1,21 +1,37 @@
-# EmailCall
+# agentCall
 
-给本机 Agent 使用的邮件网关：发送任务完成通知，或发送问题并等待用户直接回复邮件。配置、请求、错误、邮件回复及时间线持久保存在 SQLite 中。
+给本机 Agent 使用的微信／邮箱网关：微信优先，微信不可用时使用邮箱。发送任务完成通知，或发送问题并等待用户回复。配置、请求、错误、回复和路由选择持久保存在 SQLite 中。
 
-前端与 API 共用 **10086** 端口，前端地址为 [http://127.0.0.1:10086/frontend/](http://127.0.0.1:10086/frontend/)。前端提供「配置」「记录」两个页面、明暗主题、动效及减少动态效果支持。运行时使用 Python 标准库和原生 HTML/CSS/JavaScript，没有 pip、npm、Redis 或外部数据库依赖。
+## 微信配置与路由
+
+一键启动会运行 agentCall 网关和内部 Wechaty 登录服务。打开前端「配置 → 微信」，启用并保存微信配置，点击登录，在自己的微信中扫描本地显示的二维码。登录后搜索已有联系人，选择唯一的目标并保存；尚未成为好友的联系人需要先在微信中添加。先运行「检查微信连接」，再选择「微信」发送对话测试，回复测试消息即可验证双向通信。
+
+每次创建通知和实际发送前，服务都会向 Wechaty 发出实时探测，确认登录和双向连接仍有效。默认微信优先；未登录、掉线、未选择联系人或切换账号未重新确认联系人时，改用配置好的邮箱，并在记录中保存回退原因。邮箱可以独立配置，也可仅使用微信；两者都不可用时保存失败记录。指定微信的连通测试不会回退邮箱冒充成功。
+
+若微信发送已经开始但结果不确定，服务会保存「发送结果未知」，避免重复补发邮件。已经发出的等待请求留在原通道，不因之后离线而重复通知。微信只有一个待答问题时可直接回复；多个问题同时等待时，请在回复中保留相应的 `[AC:请求编号]`。回复仅接受发送时绑定的微信账号和目标联系人；旧账号、其他联系人、群聊或歧义回复不会作为决策。超时后带编号的回复继续归档，不会重新激活已超时请求。
+
+**登录条件**：使用 [python-wechaty](https://github.com/wechaty/python-wechaty) 和配套的 `wechaty-puppet-wechat` Web 微信服务。Python SDK 本身不提供独立的微信登录协议，因此 Docker 内包含 Node.js/Chromium 服务。部分微信账号不具备 Web 微信登录资格；即使能显示二维码，也可能在扫码后被微信拒绝，此时邮箱继续可用。高级设置可接入已有的兼容 Puppet Service（外部连接要求受信任 TLS）。详见 [微信接入说明](docs/wechat.md)。
+
+## 从 EmailCall 升级
+
+升级保留原 `emailcall-data` 数据卷、`emailcall.sqlite3`、邮箱配置、记录和 API 令牌。这些内部存储名刻意保留，避免创建空库。启动器会识别并停用旧 `emailcall` 容器，再启动新的 `agentcall` 项目组；不会删除旧容器或数据卷。旧 API 与已经安装的 EmailCall skill 仍可调用，新导出包和安装器名称为 `agentcall`。安装新技能会替换全局通知规则中的旧受管理区块，不改动其他规则。
+
+Docker Desktop 中使用 **agentcall 项目组**的启动／停止按钮，或新的「启动 agentCall.command／停止 agentCall.command」。微信会话和内部服务凭据另存于 `agentcall-wechat-data`、`agentcall-wechat-auth`；不要删除这些卷，否则需要重新扫码。「断开并停用微信」会停止自动恢复但保留有效会话，不等同于撤销微信端授权；配置的联系人保留，重新登录换号后需要重新选择。
+
+前端与 API 共用 **10086** 端口，前端地址为 [http://127.0.0.1:10086/frontend/](http://127.0.0.1:10086/frontend/)。前端提供「配置」「记录」两个页面、明暗主题、动效及减少动态效果支持。邮箱与 HTTP 核心使用 Python 标准库，前端为原生 HTML/CSS/JavaScript；微信通道增加固定版本的 Python Wechaty 和内部 Node/Chromium 服务，不需要 Redis 或外部数据库。
 
 ## 一键启动
 
 macOS 需先安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/) 和 Python 3。已有 Xcode Command Line Tools 通常提供 Python；没有时可运行 `xcode-select --install`。
 
-1. 双击 **启动 EmailCall.command**。启动器会启动 Docker Desktop、构建并启动容器，然后打开前端。
-2. 在「配置」保存唯一的服务邮箱、SMTP/IMAP 授权密码和唯一目标邮箱，再运行邮箱连接测试。
-3. 导出 Agent skill，解压后运行下方安装命令。在新的 Agent 会话中要求「使用 EmailCall 做连通性测试」。
-4. 在目标邮箱直接回复测试邮件。Agent 复述你的回复即完成真实收发验证。
+1. 双击 **启动 agentCall.command**。启动器会启动 Docker Desktop、构建并启动容器，然后打开前端。
+2. 在「配置」扫码登录微信并选择目标联系人；也可保存服务邮箱、SMTP/IMAP 授权密码和目标邮箱作为备用。运行对应通道的连接检查。
+3. 导出 Agent skill，解压后运行下方安装命令。在新的 Agent 会话中要求「使用 agentCall 做连通性测试」。
+4. 在实际收到消息的微信或目标邮箱回复测试。Agent 复述你的回复即完成真实收发验证。
 
-双击 **停止 EmailCall.command** 或在 Docker Desktop 停止 `emailcall` 容器即可关闭服务。再次启动时原配置和记录仍在。
+双击 **停止 agentCall.command** 或在 Docker Desktop 停止 `agentcall` 项目组即可关闭服务。再次启动时原配置和记录仍在。
 
-首次运行启动器还会安装一个**当前用户的浏览器助手**：它每 3 秒检查本机服务，仅当新的服务实例启动时打开一次前端。因此之后直接在 Docker Desktop 开启容器也会自动打开网页。它不需要管理员权限、不读取邮件或令牌，安装位置为 `~/Library/LaunchAgents/local.emailcall.browser.plist` 和 `~/Library/Application Support/EmailCall/`。容器本身无法操作 macOS 浏览器，需要这个宿主助手；首次直接运行 Docker 命令时请手动打开网址或先运行一次启动器。
+首次运行启动器还会安装一个**当前用户的浏览器助手**：它每 3 秒检查本机服务，仅当新的服务实例启动时打开一次前端。因此之后直接在 Docker Desktop 开启容器也会自动打开网页。它不需要管理员权限、不读取邮件或令牌，安装位置为 `~/Library/LaunchAgents/local.agentcall.browser.plist` 和 `~/Library/Application Support/agentCall/`。容器本身无法操作 macOS 浏览器，需要这个宿主助手；首次直接运行 Docker 命令时请手动打开网址或先运行一次启动器。
 
 移除自动打开功能：
 
@@ -51,34 +67,34 @@ Linux 可运行 `bash scripts/start.sh` 启动并通过 `xdg-open` 打开前端�
 
 ## 安装 Agent skill
 
-在配置页导出 ZIP 并解压，可得到 `emailcall/` 目录。导出包含当前 API 令牌，请把它当作本机凭据保存，不要提交到代码仓库。
+在配置页导出 ZIP 并解压，可得到 `agentcall/` 目录。导出包含当前 API 令牌，请把它当作本机凭据保存，不要提交到代码仓库。
 
 ```sh
 # 在解压目录中，为一个或两个 Agent 安装：
-python3 emailcall/install.py codex
-python3 emailcall/install.py claude
-python3 emailcall/install.py both
+python3 agentcall/install.py codex
+python3 agentcall/install.py claude
+python3 agentcall/install.py both
 ```
 
-Codex 安装到 `${CODEX_HOME:-~/.codex}/skills/emailcall`，Claude Code 安装到 `~/.claude/skills/emailcall`。安装器同时在 Codex `AGENTS.md` / Claude Code `CLAUDE.md` 中维护一个通知规则区块，要求每项任务完成时通知、需要用户选择时发送询问并等待。现有规则保留，首次修改另存 `.emailcall-backup` 备份。**安装后开启新的 Agent 会话**。仅手动复制 skill 不能保证每次任务都自动触发；全局规则使支持该机制的 Agent 获得持续指令，最终执行仍取决于 Agent 对规则的支持及更高优先级的指令。
+Codex 安装到 `${CODEX_HOME:-~/.codex}/skills/agentcall`，Claude Code 安装到 `~/.claude/skills/agentcall`。安装器同时在 Codex `AGENTS.md` / Claude Code `CLAUDE.md` 中维护一个通知规则区块，要求每项任务完成时通知、需要用户选择时发送询问并等待。现有规则保留，首次修改另存 `.agentcall-backup` 备份。**安装后开启新的 Agent 会话**。仅手动复制 skill 不能保证每次任务都自动触发；全局规则使支持该机制的 Agent 获得持续指令，最终执行仍取决于 Agent 对规则的支持及更高优先级的指令。
 
-其他 Agent 可以手动复制 `emailcall/` 至其技能目录，并在它的全局规则中添加相同的自动通知要求。开发和容器启动均不会自动修改你的 Agent 配置。
+其他 Agent 可以手动复制 `agentcall/` 至其技能目录，并在它的全局规则中添加相同的自动通知要求。开发和容器启动均不会自动修改你的 Agent 配置。
 
 卸载技能和该通知规则（不影响其他全局规则）：
 
 ```sh
-python3 emailcall/install.py both --uninstall
+python3 agentcall/install.py both --uninstall
 ```
 
-也可以直接告诉 Agent「停用 EmailCall」。若在网页轮换 API 令牌，旧技能会立即失效，需重新导出并安装。
+也可以直接告诉 Agent「停用 agentCall」。若在网页轮换 API 令牌，旧技能会立即失效，需重新导出并安装。
 
 技能 CLI 无额外 Python 依赖，示例：
 
 ```sh
-python3 emailcall/scripts/emailcall.py notify --subject '任务已完成' --body '已完成修改并通过验证。'
-python3 emailcall/scripts/emailcall.py ask --subject '请选择方案' --body 'A 保持当前行为；B 启用新行为。建议 A，超时后保持当前行为。' --timeout 300
-python3 emailcall/scripts/emailcall.py test --timeout 300
-python3 emailcall/scripts/emailcall.py status REQUEST_ID --wait-seconds 300
+python3 agentcall/scripts/agentcall.py notify --subject '任务已完成' --body '已完成修改并通过验证。'
+python3 agentcall/scripts/agentcall.py ask --subject '请选择方案' --body 'A 保持当前行为；B 启用新行为。建议 A，超时后保持当前行为。' --timeout 300
+python3 agentcall/scripts/agentcall.py test --timeout 300
+python3 agentcall/scripts/agentcall.py status REQUEST_ID --wait-seconds 300
 ```
 
 每条输出是独立 JSON。创建时立即输出幂等键和请求 ID，Agent 可在中断后恢复等待。退出码 `0` = 已发送/已回复，`2` = 失败，`3` = 服务端超时，`4` = 仍在处理或等待中断。后两者必须区分：本地命令结束不等于服务器已超时。`--no-wait` 立即返回，`--wait-seconds` 控制本地等待，`--body-file` 可安全传入多行正文。一次请求最多重试 3 次并复用幂等键，避免因网络响应丢失重复发信。
@@ -129,7 +145,7 @@ python3 emailcall/scripts/emailcall.py status REQUEST_ID --wait-seconds 300
 python3 -m unittest discover -s tests -v
 node tests/test_frontend.cjs       # 可选开发检查：前端请求丢响应后的幂等重试
 python3 scripts/verify-docker.py  # 使用独立临时容器与卷验证重启、重建持久性
-EMAILCALL_DATA_DIR=./data python3 -m gateway
+AGENTCALL_DATA_DIR=./data python3 -m gateway
 ```
 
 本地直接运行默认只监听 `127.0.0.1:10086`。不要与容器同时占用同一端口。项目不内置演示邮箱、真实凭据或伪造生产记录。自动化测试包含本机真实 TLS SMTP/IMAP 协议回环（测试时使用 OpenSSL 生成临时证书），以及 CLI 到回复的完整链路；真实邮箱连通性仍需保存你自己的账户后通过 `test` 完成。Node 只用于可选开发测试，运行应用不需要 Node。

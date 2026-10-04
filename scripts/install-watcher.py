@@ -9,7 +9,21 @@ import subprocess
 import sys
 
 
-LABEL = "local.emailcall.browser"
+LABEL = "local.agentcall.browser"
+LEGACY_LABEL = "local.emailcall.browser"
+
+
+def migrate_legacy(user_home, domain):
+    user_home = Path(user_home)
+    subprocess.run(["launchctl", "bootout", domain + "/" + LEGACY_LABEL],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    (user_home / "Library/LaunchAgents" / (LEGACY_LABEL + ".plist")).unlink(missing_ok=True)
+    old_state = user_home / "Library/Application Support/EmailCall/last-instance"
+    new_state = user_home / "Library/Application Support/agentCall/last-instance"
+    if old_state.exists() and not new_state.exists():
+        new_state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copy2(old_state, new_state)
+        new_state.chmod(0o600)
 
 
 def main():
@@ -19,16 +33,17 @@ def main():
     if sys.platform != "darwin":
         print("自动打开浏览器助手仅适用于 macOS。", file=sys.stderr)
         return 1
-    support = Path.home() / "Library/Application Support/EmailCall"
+    support = Path.home() / "Library/Application Support/agentCall"
     plist = Path.home() / "Library/LaunchAgents" / (LABEL + ".plist")
     domain = "gui/" + str(os.getuid())
+    migrate_legacy(Path.home(), domain)
     subprocess.run(["launchctl", "bootout", domain + "/" + LABEL],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     if args.uninstall:
         plist.unlink(missing_ok=True)
         if support.exists():
             shutil.rmtree(support)
-        print("已移除 EmailCall 自动打开浏览器助手；邮箱数据与容器保持不变。")
+        print("已移除 agentCall 自动打开浏览器助手；数据与容器保持不变。")
         return 0
     support.mkdir(parents=True, exist_ok=True, mode=0o700)
     watcher = support / "watch.py"

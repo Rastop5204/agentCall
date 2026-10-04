@@ -10,7 +10,7 @@ import time
 import urllib.request
 
 
-STATE_DIR = Path.home() / "Library/Application Support/EmailCall"
+STATE_DIR = Path.home() / "Library/Application Support/agentCall"
 URL = "http://127.0.0.1:10086/frontend/"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 

@@ -1,0 +1,6 @@
+interface:
+  display_name: "agentCall 通知助手"
+  short_description: "通过本机微信和邮件网关通知任务完成、询问用户决策并等待回复"
+  default_prompt: "使用 $agentcall 进行连通性测试，等待并复述我的回复。"
+policy:
+  allow_implicit_invocation: true

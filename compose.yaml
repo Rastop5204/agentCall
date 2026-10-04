@@ -1,18 +1,20 @@
-name: emailcall
+name: agentcall
 
 services:
-  emailcall:
+  agentcall:
     build: .
-    container_name: emailcall
+    container_name: agentcall
     restart: unless-stopped
     ports:
       - "127.0.0.1:10086:10086"
     volumes:
       - emailcall-data:/data
+      - agentcall-wechat-auth:/data/wechat-bridge
     environment:
       EMAILCALL_HOST: "0.0.0.0"
       EMAILCALL_PORT: "10086"
       EMAILCALL_DATA_DIR: "/data"
+      AGENTCALL_DATA_DIR: "/data"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -23,6 +25,35 @@ services:
     init: true
     stop_grace_period: 25s
 
+  agentcall-wechat:
+    build: ./docker/wechat
+    container_name: agentcall-wechat
+    restart: unless-stopped
+    depends_on:
+      agentcall:
+        condition: service_started
+    volumes:
+      - agentcall-wechat-auth:/run/agentcall:ro
+      - agentcall-wechat-data:/data
+    environment:
+      AGENTCALL_WECHAT_TOKEN_FILE: /run/agentcall/agentcall-wechat-token
+      AGENTCALL_WECHAT_LOCAL_ONLY: "1"
+      WECHATY_LOG: error
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    shm_size: 256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stop_grace_period: 25s
+
 volumes:
   emailcall-data:
     name: emailcall-data
+  agentcall-wechat-data:
+    name: agentcall-wechat-data
+  agentcall-wechat-auth:
+    name: agentcall-wechat-auth

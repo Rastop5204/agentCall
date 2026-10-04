@@ -31,9 +31,17 @@ if ! docker info >/dev/null 2>&1; then
   fi
 fi
 
-docker compose up --build -d
-printf '%s\n' '正在等待 EmailCall 就绪…'
-python3 - <<'PY'
+docker compose build
+legacy_running="$(python3 scripts/migrate-container.py)"
+if ! docker compose up --no-build -d; then
+  if [[ "$legacy_running" == 'running' ]]; then
+    docker compose stop || true
+    python3 scripts/migrate-container.py --restore || true
+  fi
+  exit 1
+fi
+printf '%s\n' '正在等待 agentCall 就绪…'
+if ! python3 - <<'PY'
 import json
 import time
 import urllib.request
@@ -48,8 +56,15 @@ for attempt in range(60):
         pass
     time.sleep(1)
 else:
-    raise SystemExit("EmailCall 未就绪。运行 docker compose logs --tail=100 查看原因。")
+    raise SystemExit("agentCall 未就绪。运行 docker compose logs --tail=100 查看原因。")
 PY
+then
+  if [[ "$legacy_running" == 'running' ]]; then
+    docker compose stop || true
+    python3 scripts/migrate-container.py --restore || true
+  fi
+  exit 1
+fi
 
 if [[ "$(uname -s)" == 'Darwin' ]]; then
   python3 scripts/install-watcher.py || true
@@ -57,4 +72,4 @@ if [[ "$(uname -s)" == 'Darwin' ]]; then
 elif command -v xdg-open >/dev/null 2>&1; then
   xdg-open 'http://127.0.0.1:10086/frontend/' >/dev/null 2>&1 || true
 fi
-printf '%s\n' 'EmailCall 已启动：http://127.0.0.1:10086/frontend/'
+printf '%s\n' 'agentCall 已启动：http://127.0.0.1:10086/frontend/'

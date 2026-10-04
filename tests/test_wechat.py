@@ -163,14 +163,16 @@ class WechatGatewayTests(unittest.TestCase):
         self.assertTrue(raised.exception.safe_to_fallback)
         self.assertEqual(self.client.sent, [])
 
-    def test_logout_and_scan_replace_old_account_and_expired_qr(self):
+    def test_poll_timeout_keeps_qr_but_cancel_clears_it(self):
         self.gateway._event("logout", {})
         self.assertIsNone(self.gateway.status()["account"])
         self.gateway._event("scan", {"qr_code": "wx://login/qr-token", "qr_status": "Waiting"})
         self.assertEqual(self.gateway.status()["state"], "awaiting_scan")
         self.assertFalse(self.gateway.status()["logged_in"])
         self.assertNotIn("qr-token", str(self.events))
-        self.gateway._event("scan", {"qr_code": "expired", "qr_status": "Timeout"})
+        self.gateway._event("scan", {"qr_code": "wx://login/qr-token", "qr_status": "Timeout"})
+        self.assertEqual(self.gateway.status()["qr_code"], "wx://login/qr-token")
+        self.gateway._event("scan", {"qr_code": "cancelled", "qr_status": "Cancel"})
         self.assertIsNone(self.gateway.status()["qr_code"])
 
     def test_saved_target_change_does_not_restart_login_session(self):

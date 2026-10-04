@@ -401,7 +401,9 @@ class WechatGateway:
     def _event(self, event, payload):
         if event == "scan":
             state = str(payload.get("qr_status") or "").lower()
-            expired = state in {"timeout", "cancel", "unknown", "5", "1", "0"}
+            # Web WeChat's 408 is a long-poll timeout, not QR invalidation.
+            # The pinned puppet labels it Timeout and supplies a usable QR.
+            expired = state in {"cancel", "unknown", "1", "0"}
             self._set(state="awaiting_scan", available=False, logged_in=False, account=None,
                       qr_code=None if expired else payload.get("qr_code"),
                       qr_status=payload.get("qr_status"), qr_updated_at=_now(), error=None)

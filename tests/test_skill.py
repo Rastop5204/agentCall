@@ -5,6 +5,8 @@ import io
 import json
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -27,7 +29,36 @@ def load_module(name, path):
 class SkillClientTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.cli = load_module("emailcall_cli", ROOT / "skills/emailcall/scripts/emailcall.py")
+        cls.cli = load_module("emailcall_cli", ROOT / "skills/agentcall/scripts/agentcall.py")
+
+    def test_new_commands_check_channels_before_creating_request(self):
+        client = mock.Mock()
+        client.request.side_effect = [{"selected_channel": "wechat", "available": True},
+                                      {"id": "request-1", "status": "sent"}]
+        with mock.patch.object(self.cli, "load_config", return_value={}), \
+                mock.patch.object(self.cli, "Client", return_value=client), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = self.cli.main(["notify", "--subject", "Done", "--body", "Finished"])
+        self.assertEqual(code, 0)
+        self.assertEqual(client.request.call_args_list[0].args, ("GET", "/api/channels"))
+        self.assertEqual(client.request.call_args_list[1].args[:2], ("POST", "/api/notify"))
+
+    def test_explicit_wechat_test_keeps_channel_choice_in_request(self):
+        client = mock.Mock()
+        client.request.side_effect = [{"selected_channel": "email", "available": True},
+                                      {"id": "request-1", "status": "queued"}]
+        with mock.patch.object(self.cli, "load_config", return_value={}), \
+                mock.patch.object(self.cli, "Client", return_value=client), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = self.cli.main(["test", "--channel", "wechat", "--no-wait"])
+        self.assertEqual(code, 4)
+        self.assertEqual(client.request.call_args_list[1].args[2]['channel'], 'wechat')
+
+    def test_legacy_cli_name_invokes_new_client(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'skills/agentcall/scripts/emailcall.py'), '--help'],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('agentCall', result.stdout)
 
     def test_credentials_cannot_be_sent_to_non_loopback_address(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -119,13 +150,13 @@ class SkillClientTests(unittest.TestCase):
 class InstallerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.installer = load_module("emailcall_installer", ROOT / "skills/emailcall/install.py")
+        cls.installer = load_module("emailcall_installer", ROOT / "skills/agentcall/install.py")
 
     def test_reinstall_manages_one_rule_and_preserves_existing_rules(self):
         with tempfile.TemporaryDirectory() as directory:
             user_home = Path(directory) / "home"
-            source = Path(directory) / "export/emailcall"
-            shutil.copytree(ROOT / "skills/emailcall", source)
+            source = Path(directory) / "export/agentcall"
+            shutil.copytree(ROOT / "skills/agentcall", source)
             (source / "config.json").write_text(json.dumps({"base_url": "http://127.0.0.1:10086", "token": "secret"}))
             root = user_home / ".codex"
             root.mkdir(parents=True)
@@ -136,10 +167,32 @@ class InstallerTests(unittest.TestCase):
             text = rules.read_text()
             self.assertEqual(text.count(self.installer.START), 1)
             self.assertIn("Always preserve my work.", text)
-            self.assertTrue((root / "skills/emailcall/SKILL.md").exists())
+            self.assertTrue((root / "skills/agentcall/SKILL.md").exists())
             self.installer.uninstall("codex", user_home=user_home)
             self.assertEqual(rules.read_text(), "# Existing rules\nAlways preserve my work.\n")
-            self.assertFalse((root / "skills/emailcall").exists())
+            self.assertFalse((root / "skills/agentcall").exists())
+
+    def test_upgrade_replaces_legacy_rule_without_changing_api_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory) / "home"
+            source = Path(directory) / "export/agentcall"
+            shutil.copytree(ROOT / "skills/agentcall", source)
+            (source / "config.json").write_text(json.dumps({"base_url": "http://127.0.0.1:10086", "token": "unchanged-token"}))
+            rules = user_home / ".codex/AGENTS.md"
+            rules.parent.mkdir(parents=True)
+            rules.write_text("Preserve my work.\n<!-- EMAILCALL:START -->\nLegacy rule\n<!-- EMAILCALL:END -->\n")
+            target, _ = self.installer.install("codex", user_home=user_home, source=source)
+            text = rules.read_text()
+            self.assertNotIn("EMAILCALL:START", text)
+            self.assertEqual(text.count(self.installer.START), 1)
+            self.assertIn("Preserve my work.", text)
+            self.assertEqual(json.loads((target / "config.json").read_text())["token"], "unchanged-token")
+            self.assertTrue((target / "scripts/emailcall.py").exists())
+
+    def test_rule_migration_keeps_separate_user_rules_on_each_side(self):
+        original = ('First user rule.\n<!-- EMAILCALL:START -->\nLegacy rule\n'
+                    '<!-- EMAILCALL:END -->\nSecond user rule.\n')
+        self.assertEqual(self.installer.remove_rule(original), 'First user rule.\nSecond user rule.\n')
 
     def test_claude_install_uses_claude_rules_and_private_config(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -149,7 +202,7 @@ class InstallerTests(unittest.TestCase):
             (source / "SKILL.md").write_text("skill")
             (source / "config.json").write_text('{"base_url":"http://127.0.0.1:10086","token":"secret"}')
             self.installer.install("claude", user_home=user_home, source=source)
-            config = user_home / ".claude/skills/emailcall/config.json"
+            config = user_home / ".claude/skills/agentcall/config.json"
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertIn(self.installer.START, (user_home / ".claude/CLAUDE.md").read_text())
 
@@ -157,7 +210,7 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             user_home = Path(directory)
             with self.assertRaises(ValueError):
-                self.installer.install("codex", user_home=user_home, source=ROOT / "skills/emailcall")
+                self.installer.install("codex", user_home=user_home, source=ROOT / "skills/agentcall")
             self.assertFalse((user_home / ".codex").exists())
 
     def test_http_export_can_be_installed_into_isolated_home(self):
@@ -181,15 +234,15 @@ class InstallerTests(unittest.TestCase):
                 with opener.open(request) as response:
                     exported = response.read()
                 with zipfile.ZipFile(io.BytesIO(exported)) as archive:
-                    self.assertTrue(all(name.startswith("emailcall/") for name in archive.namelist()))
-                    self.assertIn("emailcall/README.md", archive.namelist())
+                    self.assertTrue(all(name.startswith("agentcall/") for name in archive.namelist()))
+                    self.assertIn("agentcall/README.md", archive.namelist())
                     archive.extractall(temporary / "export")
                 target, _ = self.installer.install("codex", user_home=temporary / "home",
-                                                    source=temporary / "export/emailcall")
+                                                    source=temporary / "export/agentcall")
                 config = json.loads((target / "config.json").read_text())
                 self.assertEqual(config["base_url"], base)
                 self.assertEqual(config["token"], store.token())
-                self.assertTrue((target / "scripts/emailcall.py").exists())
+                self.assertTrue((target / "scripts/agentcall.py").exists())
             finally:
                 server.shutdown()
                 server.server_close()
@@ -227,6 +280,53 @@ class BrowserWatcherTests(unittest.TestCase):
                 mock.patch.object(self.watcher.subprocess, "run") as browser:
             self.assertFalse(self.watcher.open_if_new())
             browser.assert_not_called()
+
+    def test_legacy_watcher_is_unloaded_and_instance_marker_preserved(self):
+        installer = load_module('agentcall_watcher_install', ROOT / 'scripts/install-watcher.py')
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory)
+            legacy_plist = user_home / 'Library/LaunchAgents/local.emailcall.browser.plist'
+            legacy_plist.parent.mkdir(parents=True)
+            legacy_plist.write_text('legacy')
+            old_state = user_home / 'Library/Application Support/EmailCall/last-instance'
+            old_state.parent.mkdir(parents=True)
+            old_state.write_text('same-running-instance')
+            with mock.patch.object(installer.subprocess, 'run') as run:
+                installer.migrate_legacy(user_home, 'gui/501')
+            self.assertEqual(run.call_args.args[0], ['launchctl', 'bootout', 'gui/501/local.emailcall.browser'])
+            self.assertFalse(legacy_plist.exists())
+            self.assertEqual((user_home / 'Library/Application Support/agentCall/last-instance').read_text(),
+                             'same-running-instance')
+
+
+class DeploymentMigrationTests(unittest.TestCase):
+    def test_container_migration_stops_only_identified_legacy_service(self):
+        migration = load_module('agentcall_container_migration', ROOT / 'scripts/migrate-container.py')
+        legacy = {'Config': {'Labels': {'com.docker.compose.project': 'emailcall',
+                                       'com.docker.compose.service': 'emailcall'}},
+                  'Mounts': [{'Name': 'emailcall-data', 'Destination': '/data'}],
+                  'State': {'Running': True}}
+        with mock.patch.object(migration, 'docker', side_effect=[json.dumps([legacy]), '', '']) as docker:
+            self.assertTrue(migration.migrate())
+        self.assertEqual(docker.call_args_list[1].args, ('update', '--restart=no', 'emailcall'))
+        self.assertEqual(docker.call_args_list[2].args, ('stop', '--time', '25', 'emailcall'))
+        with mock.patch.object(migration, 'docker', return_value=json.dumps([{'Config': {}}])) as docker:
+            with self.assertRaises(RuntimeError):
+                migration.migrate()
+            self.assertEqual(docker.call_count, 1)
+
+    def test_wechat_token_is_private_stable_and_separate_from_database(self):
+        entrypoint = load_module('agentcall_entrypoint', ROOT / 'docker/entrypoint.py')
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'emailcall.sqlite3'
+            database.write_bytes(b'original-database')
+            token_file = entrypoint.ensure_wechat_token(directory)
+            original = token_file.read_text()
+            entrypoint.ensure_wechat_token(directory)
+            self.assertEqual(token_file.read_text(), original)
+            self.assertEqual(token_file.parent.name, 'wechat-bridge')
+            self.assertEqual(token_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(database.read_bytes(), b'original-database')
 
 
 if __name__ == "__main__":

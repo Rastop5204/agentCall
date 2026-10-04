@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify an EmailCall image in an isolated disposable Docker container.
+"""Verify an agentCall image in an isolated disposable Docker container.
 
 Uses no published ports and --network none. SMTP/IMAP point to the closed local
 port 9, so the test cannot send external mail. Only resources carrying this
@@ -15,7 +15,7 @@ import sys
 import uuid
 
 
-LABEL = "emailcall.verification-owner"
+LABEL = "agentcall.verification-owner"
 
 # Executed inside the test container over docker exec stdin. No token is sent to
 # host stdout: a SHA-256 fingerprint proves persistence without disclosing it.
@@ -146,10 +146,10 @@ def owned(kind, name, owner):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", default="emailcall-emailcall:latest", help="Already-built local Docker image")
+    parser.add_argument("--image", default="agentcall-agentcall:latest", help="Already-built local Docker image")
     args = parser.parse_args()
     owner = uuid.uuid4().hex
-    name = "emailcall-verify-" + owner[:12]
+    name = "agentcall-verify-" + owner[:12]
     volume = name + "-data"
     success = False
     try:
