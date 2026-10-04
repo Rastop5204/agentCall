@@ -34,7 +34,7 @@ agentCall 2.0 保持前端和本机 API 共用 10086。新增微信优先通道�
 | `GET /api/wechat/contacts?q=...` | 搜索当前账号的已有联系人，最多 100 条 |
 | `POST /api/wechat/test` | 实时检查服务、登录和目标联系人，保存诊断记录 |
 
-配置字段：`enabled`、`mode`（local/external）、`service_endpoint`、`service_token`、`target_contact_id`。目标名称和登录账号 ID 由服务端验证后保存。回传仅含 `service_token_set`，不含令牌；空令牌在服务地址不变时保留旧值。显式选定或重选联系人必须在线验证，防止客户端提交任意联系人 ID。存在活动请求时拒绝改变配置；「断开并停用微信」仍可立即停用连接并跨重启保持停用。该操作保留会话，不等同于在微信端撤销登录授权。
+配置字段：`enabled`、`mode`（local/external）、`service_endpoint`、`service_token`、`target_contact_id`。目标名称和登录账号 ID 由服务端验证后保存。回传仅含 `service_token_set`，不含令牌；空令牌在服务地址不变时保留旧值。显式选定或重选联系人必须在线验证，防止客户端提交任意联系人 ID。存在排队、发送中请求或微信等待回复时拒绝改变微信配置，已经发出的邮箱等待请求不阻止微信配置；「断开并停用微信」仍可立即停用连接并跨重启保持停用。该操作保留会话，不等同于在微信端撤销登录授权。
 
 记录新增 `channel`、`requested_channel`、`recipient_label`、`target_contact_id`、`wechat_account_id`、`transport_message_id`、`fallback_reason`。历史无通道字段的记录解释为 email。微信回复独立校验账号和联系人，不把微信 ID 伪装成邮箱地址。
 
