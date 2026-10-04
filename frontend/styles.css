@@ -1480,6 +1480,11 @@ main {
   color: var(--danger);
 }
 
+.record-preview.warning-text,
+.live-test .warning-text {
+  color: var(--warning);
+}
+
 .record-kind {
   font-size: 10px;
   color: var(--muted);
@@ -1524,6 +1529,23 @@ main {
 .status-pill svg {
   width: 11px;
   height: 11px;
+}
+
+.status-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.record-row .status-group {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.status-pill.ignored-reply {
+  background: var(--warning-bg);
+  color: var(--warning);
 }
 
 .status-pill.replied,
@@ -1847,6 +1869,39 @@ dialog[open] {
   background: var(--surface);
   border: 0;
   border-radius: 0;
+}
+
+.ignored-replies-section h3 {
+  color: var(--warning);
+}
+
+.ignored-reply-block {
+  border-left-color: var(--warning);
+}
+
+.ignored-reply-note {
+  color: var(--warning);
+  font-size: 11px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+
+.ignored-reply-reason {
+  padding: 12px 14px;
+  background: var(--warning-bg);
+  color: var(--warning);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.ignored-reply-reason p {
+  margin-top: 4px;
+}
+
+.ignored-reply-reason code {
+  display: block;
+  margin-top: 8px;
+  font-size: 9px;
 }
 
 .late-badge {

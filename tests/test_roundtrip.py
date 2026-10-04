@@ -35,13 +35,16 @@ class Mailbox:
         self.imap_commands = []
         self.smtp_envelopes = []
         self.outage = False
+        self.broken_header_search = False
+        self.trailing_internaldate = False
 
-    def inject_reply(self, original, body, sender="user@example.com"):
+    def inject_reply(self, original, body, sender="user@example.com", reference=True):
         reply = EmailMessage(policy=policy.SMTP)
         reply["From"] = sender
         reply["To"] = "agent@example.com"
         reply["Subject"] = "Re: " + str(original["Subject"])
-        reply["In-Reply-To"] = original["Message-ID"]
+        if reference:
+            reply["In-Reply-To"] = original["Message-ID"]
         reply["Message-ID"] = f"<local-reply-{len(self.inbox)}@example.com>"
         reply.set_content(body)
         # IMAP timestamps have one-second resolution; select a receipt safely
@@ -143,7 +146,8 @@ class IMAPHandler(socketserver.StreamRequestHandler):
                 if action.upper() == "SEARCH":
                     # Return all mail deliberately: the gateway must revalidate
                     # sender + correlation locally instead of trusting SEARCH.
-                    self.send("* SEARCH " + " ".join(str(i + 1) for i in range(len(box.inbox))))
+                    failed_index = box.broken_header_search and ("SUBJECT" in args or "HEADER" in args)
+                    self.send("* SEARCH " + ("" if failed_index else " ".join(str(i + 1) for i in range(len(box.inbox)))))
                 elif action.upper() == "FETCH":
                     uid, query = args.split(" ", 1)
                     body, received = box.inbox[int(uid) - 1]
@@ -154,8 +158,9 @@ class IMAPHandler(socketserver.StreamRequestHandler):
                         body = body[:int(cap[1])]
                     label = "BODY[HEADER]<0>" if "HEADER" in query else "BODY[]<0>"
                     date = received.strftime("%d-%b-%Y %H:%M:%S %z")
-                    self.send(f'* {uid} FETCH (UID {uid} INTERNALDATE "{date}" RFC822.SIZE {len(body)} {label} {{{len(body)}}}')
-                    self.wfile.write(body + b")\r\n")
+                    date_field = f' INTERNALDATE "{date}"'
+                    self.send(f'* {uid} FETCH (UID {uid}{"" if box.trailing_internaldate else date_field} RFC822.SIZE {len(body)} {label} {{{len(body)}}}')
+                    self.wfile.write(body + (date_field.encode("ascii") if box.trailing_internaldate else b"") + b")\r\n")
             elif command == "LOGOUT":
                 self.send("* BYE logout")
                 self.send(tag + " OK LOGOUT completed")
@@ -275,16 +280,31 @@ class RoundtripTests(unittest.TestCase):
         self.assertEqual(stored["status"], "sent")
         self.assertEqual(len(self.box.sent), 1)
 
+    def test_mime_subject_without_thread_headers_survives_broken_provider_search(self):
+        record, original = self.create_ask()
+        self.box.broken_header_search = True
+        self.box.trailing_internaldate = True
+        self.box.inject_reply(original, "你好，接收正常。", reference=False)
+        self.app.poll_once()
+        self.assertIsNone(self.app.poll_error)
+        stored = self.store.get(record["id"])
+        self.assertEqual(stored["status"], "replied")
+        self.assertEqual(stored["reply"]["body"], "你好，接收正常。")
+
     def test_wrong_sender_cannot_finish_request_then_real_sender_can(self):
         record, original = self.create_ask()
         self.box.inject_reply(original, "不要执行", sender="intruder@example.com")
         self.app.poll_once()
-        self.assertEqual(self.store.get(record["id"])["status"], "waiting")
+        ignored = self.store.get(record["id"])
+        self.assertEqual(ignored["status"], "waiting")
+        self.assertEqual(ignored["ignored_replies"][0]["ignored_reason"]["code"], "REPLY_SENDER_MISMATCH")
+        self.assertIsNone(ignored["reply"])
         self.box.inject_reply(original, "确认执行")
         self.app.poll_once()
         stored = self.store.get(record["id"])
         self.assertEqual(stored["status"], "replied")
         self.assertEqual(len(stored["replies"]), 1)
+        self.assertEqual(len(stored["ignored_replies"]), 1)
         self.assertEqual(stored["reply"]["body"], "确认执行")
 
     def test_imap_outage_is_recorded_and_wait_expires(self):

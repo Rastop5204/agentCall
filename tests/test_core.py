@@ -1,6 +1,7 @@
+import json
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from datetime import datetime, timedelta, timezone
 
 from gateway.store import Store
@@ -154,6 +155,95 @@ class CoreTests(unittest.TestCase):
                     from_email='stranger@example.com', body='approve', received_at=datetime.now(timezone.utc).isoformat()))
         self.assertFalse(accepted)
         self.assertEqual(self.store.get(record['id'])['status'], 'waiting')
+
+    def test_poll_records_sender_mismatch_without_accepting_it(self):
+        self.configure()
+        transport = Mock()
+        app = Gateway(self.store, transport)
+        record = app.create('ask', {'subject': 'Question', 'body': 'Pick one'})
+        app.send_once()
+        rejected = dict(request_id=record['id'], message_id='<other@example.com>',
+                        from_email='other@example.com', body='选 A',
+                        received_at=datetime.now(timezone.utc).isoformat(),
+                        ignored_reason={'code': 'REPLY_SENDER_MISMATCH',
+                                        'message': '回复的发件地址与目标邮箱不一致。',
+                                        'hint': '请使用目标邮箱回复。'})
+        transport.poll_replies.return_value = [rejected]
+        app.poll_once()
+        stored = self.store.get(record['id'])
+        self.assertEqual(stored['status'], 'waiting')
+        self.assertIsNone(stored['reply'])
+        self.assertEqual(stored['replies'], [])
+        self.assertEqual(stored['ignored_replies'][0]['ignored_reason']['code'], 'REPLY_SENDER_MISMATCH')
+        self.assertEqual(stored['ignored_replies'][0]['body'], '选 A')
+
+        transport.poll_replies.return_value = [dict(request_id=record['id'], message_id='<user@example.com>',
+                     from_email='user@example.com', body='选 B', received_at=datetime.now(timezone.utc).isoformat())]
+        app.poll_once()
+        stored = self.store.get(record['id'])
+        self.assertEqual(stored['status'], 'replied')
+        self.assertEqual(stored['reply']['body'], '选 B')
+        self.assertEqual(len(stored['ignored_replies']), 1)
+
+    def test_ignored_reply_survives_restart_and_is_deduplicated(self):
+        self.configure()
+        record = self.app.create('ask', {'subject': 'Question', 'body': 'Pick one'})
+        self.store.claim_next()
+        self.store.mark_sent(record['id'])
+        rejected = dict(request_id=record['id'], message_id='<other@example.com>',
+                        from_email='other@example.com', body='选 A',
+                        received_at=datetime.now(timezone.utc).isoformat(),
+                        ignored_reason={'code': 'REPLY_SENDER_MISMATCH',
+                                        'message': '回复的发件地址与目标邮箱不一致。',
+                                        'hint': '请使用目标邮箱回复。'})
+        self.assertTrue(self.store.add_ignored_reply(rejected))
+        self.store.close()
+        self.store = Store(self.tmp.name)
+        self.assertFalse(self.store.add_ignored_reply(rejected))
+        stored = self.store.get(record['id'])
+        self.assertEqual(stored['status'], 'waiting')
+        self.assertEqual(len(stored['ignored_replies']), 1)
+        self.assertEqual(len([event for event in stored['events'] if event['type'] == 'ignored_reply']), 1)
+        self.assertEqual(self.store.list_records(q='other@example.com')['total'], 1)
+
+    def test_legacy_records_have_empty_ignored_replies(self):
+        self.configure()
+        record = self.app.create('notify', {'subject': 'Done', 'body': 'Finished'}, 'legacy-record-key')
+        record.pop('ignored_replies', None)
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE records SET data=? WHERE id=?', (json.dumps(record), record['id']))
+        self.assertEqual(self.store.get(record['id'])['ignored_replies'], [])
+        self.assertEqual(self.store.list_records()['items'][0]['ignored_replies'], [])
+        self.assertEqual(self.store.by_key('legacy-record-key')[0]['ignored_replies'], [])
+
+    def test_poll_scan_state_survives_success_and_resets_after_storage_error(self):
+        self.configure()
+        transport = Mock()
+        app = Gateway(self.store, transport)
+        record = app.create('notify', {'subject': 'Done', 'body': 'Finished'})
+        app.send_once()
+        seen_states = []
+
+        def poll(config, records, scan_state):
+            seen_states.append(dict(scan_state))
+            scan_state['last_uid'] = 42
+            return []
+
+        transport.poll_replies.side_effect = poll
+        app.poll_once()
+        app.poll_once()
+        self.assertEqual(seen_states, [{}, {'last_uid': 42}])
+        app.save_config({**CONFIG, 'imap_folder': 'Archive'})
+        app.poll_once()
+        self.assertEqual(seen_states[-1], {})
+
+        transport.poll_replies.side_effect = None
+        transport.poll_replies.return_value = [dict(request_id=record['id'], message_id='<r@example.com>',
+                        from_email='user@example.com', body='Thanks', received_at=datetime.now(timezone.utc).isoformat())]
+        transport.explain_error.return_value = dict(code='IMAP_ERROR', message='收件失败', hint='检查连接')
+        with patch.object(self.store, 'add_reply', side_effect=OSError('disk full')):
+            app.poll_once()
+        self.assertEqual(app.imap_scan_state, {})
 
     def test_successful_connection_diagnostic_is_never_a_sendable_mail(self):
         from unittest.mock import patch

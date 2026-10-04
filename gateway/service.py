@@ -73,6 +73,8 @@ class Gateway:
         self.poll_error = store.setting('poll_error')
         self.last_poll_at = store.setting('last_poll_at')
         self.diagnostic_lock = threading.Lock()
+        self.imap_scan_state = {}
+        self.imap_scan_identity = None
 
     def config_view(self):
         config = {**DEFAULT_CONFIG, **self.store.config()}
@@ -186,10 +188,18 @@ class Gateway:
         started_at = utcnow()
         mailbox_checked = False
         try:
+            identity = tuple(config.get(key) for key in
+                             ('imap_host', 'imap_port', 'imap_security', 'username', 'email', 'imap_folder'))
+            if identity != self.imap_scan_identity:
+                self.imap_scan_state.clear()
+                self.imap_scan_identity = identity
             records = self.store.poll_records()
             if records:
-                for reply in self.transport.poll_replies(config, records):
-                    self.store.add_reply(reply)
+                for reply in self.transport.poll_replies(config, records, scan_state=self.imap_scan_state):
+                    if reply.get('ignored_reason'):
+                        self.store.add_ignored_reply(reply)
+                    else:
+                        self.store.add_reply(reply)
                 mailbox_checked = True
             if self.poll_error:
                 self.store.set_setting('poll_error', None)
@@ -197,6 +207,8 @@ class Gateway:
             self.last_poll_at = stamp()
             self.store.set_setting('last_poll_at', self.last_poll_at)
         except Exception as exc:
+            # Revisit fetched messages if persisting any result failed after scanning.
+            self.imap_scan_state.clear()
             error = self.transport.explain_error(exc, 'imap')
             if error != self.poll_error:
                 self.store.diagnostic([{'name': 'IMAP 收件检查', 'ok': False, 'error': error}])

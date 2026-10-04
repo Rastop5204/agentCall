@@ -17,6 +17,7 @@ from email import policy
 from email.message import EmailMessage, Message
 from email.parser import BytesParser
 from email.utils import formataddr, format_datetime, getaddresses
+from html import unescape
 from html.parser import HTMLParser
 
 SOCKET_TIMEOUT = 15
@@ -24,7 +25,6 @@ MAX_HEADER_BYTES = 32 * 1024
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_REPLY_CHARS = 32000
 MAX_CANDIDATES = 100
-MAX_SEARCH_BYTES = 6000
 _ID = re.compile(r"<[^<>\s]+>")
 _SUBJECT_TOKEN = re.compile(r"\[EC:([A-Za-z0-9_-]+)\]")
 
@@ -47,6 +47,8 @@ def explain_error(exc: Exception, phase: str = "smtp") -> dict:
         return exc.as_dict()
     if isinstance(exc, smtplib.SMTPAuthenticationError):
         result = ("SMTP_AUTH_FAILED", "发件服务器拒绝了登录。", "请检查账号及应用专用密码／客户端授权码，并在邮箱设置中开启 SMTP。普通登录密码通常不能用于此处。")
+    elif isinstance(exc, ssl.SSLCertVerificationError) and getattr(exc, "verify_code", None) == 62:
+        result = ("TLS_HOSTNAME_MISMATCH", "邮件服务器返回的证书与配置的服务器地址不匹配。", "请确认 SMTP／IMAP 地址正确；若间歇发生，可能是服务商节点或网络代理异常。后台会重新检查收件，请勿关闭证书校验。")
     elif isinstance(exc, ssl.SSLCertVerificationError):
         result = ("TLS_CERTIFICATE_INVALID", "邮件服务器的安全证书无法验证。", "检查服务器地址、系统时间与网络代理；请勿关闭证书校验。")
     elif isinstance(exc, ssl.SSLError):
@@ -300,6 +302,7 @@ def _trim_quotes(text: str) -> str:
         wrapped = " ".join(part.strip() for part in lines[index:index + 3])
         if (re.match(r"^On\s.+wrote\s*:", wrapped, re.I)
                 or re.match(r"^在\s?.+(?:写道|寫道)[：:]\s*$", stripped)
+                or re.match(r"^.+[>＞]\s*在\s*\d{4}年\d{1,2}月\d{1,2}日.+(?:写道|寫道)[：:]\s*$", unescape(stripped))
                 or re.match(r"^-{2,}\s*(?:Original Message|原始邮件|原始郵件|转发邮件|Forwarded message)\s*-*", stripped, re.I)
                 or stripped == "—— EmailCall · 等待您的回复 ——"):
             break
@@ -356,7 +359,7 @@ def _automated(message: Message) -> bool:
     return message.get_content_type() in {"multipart/report", "message/delivery-status"}
 
 
-def _match_record(message: Message, records: list[dict]) -> tuple[dict | None, str]:
+def _match_record(message: Message, records: list[dict], *, check_sender: bool = True) -> tuple[dict | None, str]:
     if _automated(message):
         return None, ""
     addresses = getaddresses(message.get_all("From", []))
@@ -364,24 +367,26 @@ def _match_record(message: Message, records: list[dict]) -> tuple[dict | None, s
         return None, ""
     sender = addresses[0][1].strip().casefold()
     references = set(_ID.findall(" ".join(str(message.get(key, "")) for key in ("In-Reply-To", "References"))))
-    has_thread_header = bool(message.get("In-Reply-To") or message.get("References"))
     tokens = set(_SUBJECT_TOKEN.findall(str(message.get("Subject", ""))))
     own_id = str(message.get("Message-ID", "")).strip()
-    matches = []
-    for record in records:
-        if sender != record["target_email"].casefold() or own_id == record["message_id"]:
-            continue
-        if record["message_id"] in references or (not has_thread_header and record["id"] in tokens):
-            matches.append(record)
-    if len(matches) == 1:
-        return matches[0], sender
-    # Ambiguous reference chains must never decide two waiting requests.
+    if len(tokens) > 1 or any(own_id == record["message_id"] for record in records):
+        return None, ""
+    matches = [record for record in records if record["message_id"] in references]
+    # Resolve known thread IDs before using a subject fallback. Providers may
+    # rewrite thread IDs, but a known conflicting request must not be ignored.
     if len(matches) > 1:
         direct = set(_ID.findall(str(message.get("In-Reply-To", ""))))
-        direct_matches = [record for record in matches if record["message_id"] in direct]
-        if len(direct_matches) == 1:
-            return direct_matches[0], sender
-    return None, ""
+        matches = [record for record in matches if record["message_id"] in direct]
+    elif not matches:
+        matches = [record for record in records if record["id"] in tokens]
+    if len(matches) != 1:
+        return None, ""
+    record = matches[0]
+    if tokens and record["id"] not in tokens:
+        return None, ""
+    if check_sender and sender != record["target_email"].casefold():
+        return None, ""
+    return record, sender
 
 
 def _internal_date(metadata: bytes) -> str | None:
@@ -402,80 +407,75 @@ def _fetch(client, uid: bytes, query: str) -> tuple[bytes, bytes] | None:
     status, data = client.uid("fetch", uid, query)
     if status != "OK":
         raise MailError("IMAP_FETCH_FAILED", "无法读取邮件内容。", "收件服务器可能临时繁忙，系统将在下次轮询时重试。")
-    for item in data or []:
+    for index, item in enumerate(data or []):
         if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bytes):
-            return item[0], item[1]
+            metadata = item[0]
+            response_uid = re.search(rb"\bUID (\d+)\b", metadata)
+            if response_uid and response_uid[1] != uid:
+                continue
+            # FETCH attributes may follow the BODY literal. Use only protocol
+            # fragments, never the sender-controlled message bytes, for dates.
+            for tail in data[index + 1:]:
+                if not isinstance(tail, bytes):
+                    break
+                metadata += b" " + tail
+                if tail.rstrip().endswith(b")"):
+                    break
+            return metadata, item[1]
     return None  # Message may have been removed between SEARCH and FETCH.
 
 
-def _or_terms(terms: list[str]) -> str:
-    if len(terms) == 1:
-        return terms[0]
-    return "OR " + terms[0] + " (" + _or_terms(terms[1:]) + ")"
-
-
-def poll_replies(config: dict, records: list[dict]) -> list[dict]:
+def poll_replies(config: dict, records: list[dict], scan_state: dict | None = None) -> list[dict]:
     """Read matching replies without marking mail read, moving, or deleting it.
 
-    Search is constrained by thread headers/subject tokens and oldest creation
-    date. Fetch at most the latest 100 matching candidates per cycle, each with
-    a 32 KiB header and a 1 MiB body cap. No attachment is opened or executed.
+    Search by arrival date, then correlate decoded headers locally: some IMAP
+    providers miss MIME-encoded subjects. Half the 100-header budget checks new
+    mail and half rotates through older mail, so neither can starve the other.
+    Only correlated mail bodies are fetched (1 MiB cap); never open attachments.
     """
     records = [record for record in records if record.get("message_id") and record.get("target_email")]
     if not records:
         return []
+    if scan_state is None:
+        scan_state = {}
     try:
         oldest = min(_parse_time(record["created_at"]) for record in records) - timedelta(days=1)
         months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
         since = f"{oldest.day:02d}-{months[oldest.month - 1]}-{oldest.year}"
         results = []
         with _imap(config) as client:
+            _, validity = client.response("UIDVALIDITY")
+            mailbox_id = tuple(config.get(key) for key in ("imap_host", "imap_port", "imap_security", "username", "email", "imap_folder")) + (tuple(validity or []),)
+            if scan_state.get("mailbox_id") != mailbox_id:
+                scan_state.clear()
+                scan_state["mailbox_id"] = mailbox_id
             candidates = set()
-            predicates = []
-            for record in records:
-                terms = [
-                    "HEADER In-Reply-To " + _quote(record["message_id"]),
-                    "HEADER References " + _quote(record["message_id"]),
-                    "SUBJECT " + _quote("[EC:" + record["id"] + "]"),
-                ]
-                predicate = _or_terms(terms)
-                # Excluding persisted reply IDs prevents old conversations from
-                # consuming the fetch budget on every poll. Bound command size.
-                known = [record["message_id"]] + [reply.get("message_id", "") for reply in reversed(record.get("replies", []))]
-                for identifier in known:
-                    if not _ID.fullmatch(identifier) or len(identifier) > 256 or "@emailcall.local>" in identifier and identifier.startswith("<sha256-"):
-                        continue
-                    exclusion = " NOT HEADER Message-ID " + _quote(identifier)
-                    if len(predicate) + len(exclusion) > 4000:
-                        break
-                    predicate += exclusion
-                predicates.append("(" + predicate + ")")
-            batches, batch = [], []
-            for predicate in predicates:
-                if batch and sum(map(len, batch)) + len(predicate) > MAX_SEARCH_BYTES:
-                    batches.append(batch)
-                    batch = []
-                batch.append(predicate)
-            if batch:
-                batches.append(batch)
-            for batch in batches:
-                criteria = "(SINCE " + since + " " + _or_terms(batch) + ")"
-                status, data = client.uid("search", None, criteria)
-                if status != "OK":
-                    raise MailError("IMAP_SEARCH_FAILED", "无法搜索回复邮件。", "请检查 IMAP 服务与文件夹设置，系统将在下次轮询时重试。")
-                for item in data or []:
-                    if isinstance(item, bytes):
-                        candidates.update(uid for uid in item.split() if uid.isdigit())
-            for uid in sorted(candidates, key=int)[-MAX_CANDIDATES:]:
+            status, data = client.uid("search", None, "(SINCE " + since + ")")
+            if status != "OK":
+                raise MailError("IMAP_SEARCH_FAILED", "无法搜索回复邮件。", "请检查 IMAP 服务与文件夹设置，系统将在下次轮询时重试。")
+            for item in data or []:
+                if isinstance(item, bytes):
+                    candidates.update(uid for uid in item.split() if uid.isdigit())
+            ordered = sorted(candidates, key=int)
+            if len(ordered) > MAX_CANDIDATES:
+                recent_budget = MAX_CANDIDATES // 2
+                older, recent = ordered[:-recent_budget], ordered[-recent_budget:]
+                cursor = scan_state.get("older_uid", 0)
+                remaining = [uid for uid in older if int(uid) > cursor]
+                wrapped = [uid for uid in older if int(uid) <= cursor]
+                batch = (remaining + wrapped)[:MAX_CANDIDATES - recent_budget]
+                scan_state["older_uid"] = int(batch[-1])
+                ordered = sorted(batch + recent, key=int)
+            for uid in ordered:
                 fetched = _fetch(client, uid, f"(INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER]<0.{MAX_HEADER_BYTES}>)")
                 if not fetched:
                     continue
                 metadata, raw_header = fetched
                 message = BytesParser(policy=policy.default).parsebytes(raw_header[:MAX_HEADER_BYTES], headersonly=True)
-                record, sender = _match_record(message, records)
+                record, sender = _match_record(message, records, check_sender=False)
                 if record is None:
                     continue
-                existing_ids = {reply.get("message_id") for reply in record.get("replies", [])}
+                existing_ids = {reply.get("message_id") for reply in record.get("replies", []) + record.get("ignored_replies", [])}
                 if str(message.get("Message-ID", "")).strip() in existing_ids:
                     continue
                 received_at = _internal_date(metadata)
@@ -492,7 +492,7 @@ def poll_replies(config: dict, records: list[dict]) -> list[dict]:
                 # A server must honor partial FETCH; still enforce local limits.
                 raw = raw[:MAX_MESSAGE_BYTES]
                 message = BytesParser(policy=policy.default).parsebytes(raw)
-                verified_record, verified_sender = _match_record(message, records)
+                verified_record, verified_sender = _match_record(message, records, check_sender=False)
                 if verified_record is None or verified_record["id"] != record["id"] or verified_sender != sender:
                     continue
                 body = _body(message)
@@ -503,7 +503,16 @@ def poll_replies(config: dict, records: list[dict]) -> list[dict]:
                 message_id = str(message.get("Message-ID", "")).strip()
                 if not _ID.fullmatch(message_id):
                     message_id = "<sha256-" + hashlib.sha256(raw + received_at.encode()).hexdigest() + "@emailcall.local>"
-                results.append({"request_id": record["id"], "message_id": message_id, "from_email": sender, "body": body, "received_at": received_at})
+                if message_id in existing_ids:
+                    continue
+                item = {"request_id": record["id"], "message_id": message_id, "from_email": sender, "body": body, "received_at": received_at}
+                if sender != record["target_email"].casefold():
+                    item["ignored_reason"] = {
+                        "code": "REPLY_SENDER_MISMATCH",
+                        "message": "已收到回复，但发件地址与该请求的目标邮箱不一致，未作为用户决策采纳。",
+                        "hint": "请切换到收到通知的目标邮箱直接回复；邮箱转发或其他账号代发不会自动获得回复权限。",
+                    }
+                results.append(item)
         return results
     except Exception as exc:
         _raise_safe(exc, "imap")

@@ -85,6 +85,9 @@ class FakeIMAP:
         self.readonly = readonly
         return "OK", [str(len(self.messages)).encode()]
 
+    def response(self, name):
+        return name, [b"1"]
+
     def uid(self, command, *args):
         self.requests.append((command, args))
         if command.lower() == "search":
@@ -103,6 +106,14 @@ class FakeIMAP:
 
 
 class MailTransportTests(unittest.TestCase):
+    def test_certificate_hostname_mismatch_has_specific_safe_explanation(self):
+        error = ssl.SSLCertVerificationError(1, "private server details")
+        error.verify_code = 62
+        explained = mail.explain_error(error, "imap")
+        self.assertEqual(explained["code"], "TLS_HOSTNAME_MISMATCH")
+        self.assertIn("服务器地址", explained["message"])
+        self.assertNotIn("private", str(explained))
+
     def test_send_uses_saved_message_id_target_and_explicit_reply_deadline(self):
         smtp = FakeSMTP()
         with patch.object(mail.smtplib, "SMTP_SSL", return_value=smtp):
@@ -233,23 +244,80 @@ class ReplyTests(unittest.TestCase):
         self.assertTrue(all("BODY.PEEK[" in query for query in fetches))
         self.assertTrue(all("<0." in query for query in fetches))
 
-    def test_wrong_sender_automated_and_unrelated_messages_are_ignored(self):
+    def test_wrong_sender_is_reported_but_automated_and_unrelated_mail_is_ignored(self):
         wrong = reply(sender="Attacker <other@example.com>")
         auto = reply(**{"Auto-Submitted": "auto-replied"})
         unrelated = reply(reference=False)
         unrelated.replace_header("Subject", "unrelated")
         found, _ = self.collect([wrong, auto, unrelated])
-        self.assertEqual(found, [])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["from_email"], "other@example.com")
+        self.assertEqual(found[0]["ignored_reason"]["code"], "REPLY_SENDER_MISMATCH")
+
+    def test_netease_mime_subject_search_failure_does_not_hide_reply(self):
+        imap = FakeIMAP([reply(reference=False)])
+        original_uid = imap.uid
+        def uid(command, *args):
+            if command == "search" and ("SUBJECT" in args[-1] or "HEADER" in args[-1]):
+                return "OK", [b""]
+            return original_uid(command, *args)
+        imap.uid = uid
+        with patch.object(mail.imaplib, "IMAP4_SSL", return_value=imap):
+            found = mail.poll_replies(CONFIG, [RECORD])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["body"], "继续执行")
 
     def test_subject_token_fallback_accepts_missing_thread_headers(self):
         found, _ = self.collect([reply(reference=False)])
         self.assertEqual(len(found), 1)
 
-    def test_conflicting_thread_header_overrides_subject_token(self):
+    def test_unknown_rewritten_thread_header_allows_exact_subject_token(self):
         message = reply(reference=False)
-        message["In-Reply-To"] = "<unrelated@example.com>"
+        message["In-Reply-To"] = "<provider-rewritten@example.com>"
+        found, _ = self.collect([message])
+        self.assertEqual(len(found), 1)
+
+    def test_conflicting_known_thread_header_cannot_choose_another_request(self):
+        message = reply(reference=False)
+        message["In-Reply-To"] = "<other-request@example.com>"
+        other = dict(RECORD, id="other", message_id="<other-request@example.com>")
+        found, _ = self.collect([message], records=[RECORD, other])
+        self.assertEqual(found, [])
+
+    def test_multiple_subject_tokens_are_ambiguous(self):
+        message = reply(reference=False)
+        message.replace_header("Subject", str(message["Subject"]) + " [EC:other]")
         found, _ = self.collect([message])
         self.assertEqual(found, [])
+
+    def test_internaldate_after_body_literal_is_preserved(self):
+        imap = FakeIMAP([reply()])
+        original_uid = imap.uid
+        def uid(command, *args):
+            status, data = original_uid(command, *args)
+            if command == "fetch":
+                metadata, raw = data[0]
+                metadata = metadata.replace(b' INTERNALDATE "04-Oct-2026 10:04:00 +0800"', b"")
+                data = [(metadata, raw), b' INTERNALDATE "04-Oct-2026 10:04:00 +0800")']
+            return status, data
+        imap.uid = uid
+        with patch.object(mail.imaplib, "IMAP4_SSL", return_value=imap):
+            found = mail.poll_replies(CONFIG, [RECORD])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["received_at"], "2026-10-04T02:04:00+00:00")
+
+    def test_message_body_cannot_supply_missing_internaldate(self):
+        imap = FakeIMAP([reply('INTERNALDATE "04-Oct-2026 10:04:00 +0800"')])
+        original_uid = imap.uid
+        def uid(command, *args):
+            status, data = original_uid(command, *args)
+            if command == "fetch":
+                metadata, raw = data[0]
+                data = [(metadata.replace(b' INTERNALDATE "04-Oct-2026 10:04:00 +0800"', b""), raw), b")"]
+            return status, data
+        imap.uid = uid
+        with patch.object(mail.imaplib, "IMAP4_SSL", return_value=imap):
+            self.assertEqual(mail.poll_replies(CONFIG, [RECORD]), [])
 
     def test_multiple_from_addresses_are_rejected(self):
         found, _ = self.collect([reply(sender="user@example.com, other@example.com")])
@@ -280,14 +348,48 @@ class ReplyTests(unittest.TestCase):
         found, _ = self.collect([reply("暂停。\n\nOn Sunday, October 4, 2026 at 10:00 AM\nCodex <agent@example.com> wrote:\n原邮件的内容")])
         self.assertEqual(found[0]["body"], "暂停。")
 
+    def test_chinese_sender_first_quote_separator_is_removed(self):
+        message = reply()
+        message.set_content('<div>你好</div><div>EmailCall · Codex&lt;agent@example.com&gt;&gt;&nbsp;在 2026年10月5日 周一 0:45 写道：</div><div>请选择下一步</div>', subtype="html")
+        found, _ = self.collect([message])
+        self.assertEqual(found[0]["body"], "你好")
+
+    def test_plaintext_quote_attribution_with_literal_html_entities_is_removed(self):
+        found, _ = self.collect([reply("你好\n\n EmailCall · Codex<agent@example.com&gt;&nbsp;在 2026年10月5日 周一 0:45 写道：\n请选择下一步")])
+        self.assertEqual(found[0]["body"], "你好")
+
     def test_previously_persisted_reply_is_not_downloaded_again(self):
         record = dict(RECORD, replies=[{"message_id": "<reply-001@example.com>"}])
         found, imap = self.collect([reply()], records=[record])
         self.assertEqual(found, [])
         body_queries = [args[1] for command, args in imap.requests if command.lower() == "fetch" and "HEADER" not in args[1]]
         self.assertEqual(body_queries, [])
-        searches = [args[-1] for command, args in imap.requests if command.lower() == "search"]
-        self.assertTrue(any('NOT HEADER Message-ID "<reply-001@example.com>"' in query for query in searches))
+
+    def test_previously_ignored_reply_is_not_downloaded_again(self):
+        record = dict(RECORD, ignored_replies=[{"message_id": "<reply-001@example.com>"}])
+        found, imap = self.collect([reply(sender="other@example.com")], records=[record])
+        self.assertEqual(found, [])
+        self.assertFalse(any(command == "fetch" and "HEADER" not in args[1] for command, args in imap.requests))
+
+    def test_old_reply_is_eventually_found_behind_unrelated_recent_mail(self):
+        messages = []
+        for index in range(210):
+            message = reply(reference=False)
+            message.replace_header("Subject", "Unrelated mail " + str(index))
+            messages.append(message)
+        messages.insert(80, reply())
+        imap = FakeIMAP(messages)
+        state = {}
+        found = []
+        with patch.object(mail.imaplib, "IMAP4_SSL", return_value=imap):
+            for cycle in range(5):
+                imap.requests.clear()
+                found.extend(mail.poll_replies(CONFIG, [RECORD], scan_state=state))
+                if cycle == 0:
+                    self.assertEqual(found, [])
+                headers = [args for command, args in imap.requests if command == "fetch" and "HEADER" in args[1]]
+                self.assertLessEqual(len(headers), mail.MAX_CANDIDATES)
+        self.assertTrue(any(item["body"] == "继续执行" for item in found))
 
     def test_recent_candidates_are_not_starved_by_old_messages(self):
         messages = []

@@ -18,6 +18,12 @@ def stamp(value=None):
     return (value or utcnow()).isoformat(timespec='milliseconds')
 
 
+def record_data(value):
+    record = json.loads(value)
+    record.setdefault('ignored_replies', [])
+    return record
+
+
 class Store:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -46,12 +52,15 @@ class Store:
           CREATE TABLE IF NOT EXISTS replies (
             request_id TEXT NOT NULL, message_id TEXT NOT NULL, data TEXT NOT NULL,
             PRIMARY KEY(request_id,message_id));
+          CREATE TABLE IF NOT EXISTS ignored_replies (
+            request_id TEXT NOT NULL, message_id TEXT NOT NULL, data TEXT NOT NULL,
+            PRIMARY KEY(request_id,message_id));
         ''')
         if not self.setting('token'):
             self.set_setting('token', secrets.token_urlsafe(32))
         # SMTP has no exactly-once delivery protocol. Never retry an uncertain DATA commit.
         for row in self.db.execute("SELECT data FROM records WHERE status='sending'").fetchall():
-            record = json.loads(row['data'])
+            record = record_data(row['data'])
             self.fail(record['id'], {'code': 'DELIVERY_UNKNOWN', 'message': '服务在发送过程中停止，邮件投递结果未知。',
                                      'hint': '请先检查目标邮箱，再决定是否以新请求重发，避免重复邮件。'})
 
@@ -92,12 +101,12 @@ class Store:
     def get(self, request_id):
         with self.lock:
             row = self.db.execute('SELECT data FROM records WHERE id=?', (request_id,)).fetchone()
-            return json.loads(row['data']) if row else None
+            return record_data(row['data']) if row else None
 
     def by_key(self, key):
         with self.lock:
             row = self.db.execute('SELECT data,fingerprint FROM records WHERE idempotency_key=?', (key,)).fetchone()
-            return (json.loads(row['data']), row['fingerprint']) if row else None
+            return (record_data(row['data']), row['fingerprint']) if row else None
 
     def insert(self, kind, payload, config, key=None, fingerprint=None, error=None):
         request_id = uuid.uuid4().hex
@@ -108,7 +117,8 @@ class Store:
                       sender_email=config.get('email', ''), status=initial_status,
                       created_at=now, updated_at=now, sent_at=None, deadline_at=None,
                       timeout_seconds=payload.get('timeout_seconds', 300) if kind == 'ask' else None,
-                      message_id=f'<ec.{request_id}@emailcall.local>', error=error, reply=None, replies=[], events=[])
+                      message_id=f'<ec.{request_id}@emailcall.local>', error=error, reply=None, replies=[],
+                      ignored_replies=[], events=[])
         self._event(record, record['status'], error['message'] if error else ('邮箱连接检查完成。' if kind == 'diagnostic' else '请求已保存，等待发送。'))
         with self.lock, self.db:
             self.db.execute('INSERT INTO records VALUES (?,?,?,?,?,?,?)',
@@ -121,7 +131,7 @@ class Store:
             row = self.db.execute("SELECT data FROM records WHERE status='queued' AND kind IN ('ask','notify') ORDER BY created_at LIMIT 1").fetchone()
             if not row:
                 return None
-            record = json.loads(row['data'])
+            record = record_data(row['data'])
             record['status'] = 'sending'
             if record['kind'] == 'ask':
                 record['deadline_at'] = stamp(utcnow() + timedelta(seconds=record['timeout_seconds']))
@@ -154,7 +164,7 @@ class Store:
         now = now or utcnow()
         with self.lock, self.db:
             for row in self.db.execute("SELECT data FROM records WHERE status='waiting'").fetchall():
-                record = json.loads(row['data'])
+                record = record_data(row['data'])
                 deadline = datetime.fromisoformat(record['deadline_at'])
                 # A final IMAP sweep can observe a timely arrival just after the deadline.
                 # During outages the independent clock still ends waiting within 30 seconds.
@@ -173,7 +183,7 @@ class Store:
     def add_reply(self, item):
         with self.lock, self.db:
             record = self.get(item['request_id'])
-            if not record or record['target_email'].casefold() != item['from_email'].casefold():
+            if not record or item.get('ignored_reason') or record['target_email'].casefold() != item['from_email'].casefold():
                 return False
             if self.db.execute('SELECT 1 FROM replies WHERE request_id=? AND message_id=?',
                                (record['id'], item['message_id'])).fetchone():
@@ -192,6 +202,25 @@ class Store:
             self._save(record)
             return True
 
+    def add_ignored_reply(self, item):
+        """Keep rejected thread matches visible without treating them as user decisions."""
+        with self.lock, self.db:
+            record = self.get(item['request_id'])
+            if not record or not item.get('ignored_reason'):
+                return False
+            if self.db.execute('SELECT 1 FROM ignored_replies WHERE request_id=? AND message_id=?',
+                               (record['id'], item['message_id'])).fetchone():
+                return False
+            reply = {k: item[k] for k in ('message_id', 'from_email', 'body', 'received_at')}
+            reply['ignored_reason'] = item['ignored_reason']
+            self.db.execute('INSERT INTO ignored_replies VALUES (?,?,?)',
+                            (record['id'], item['message_id'], json.dumps(reply)))
+            record['ignored_replies'].append(reply)
+            self._event(record, 'ignored_reply',
+                        f"收到来自 {reply['from_email']} 的邮件，未采纳为回复：{reply['ignored_reason']['message']}")
+            self._save(record)
+            return True
+
     def poll_records(self):
         # Retain a bounded late-reply window, always prioritizing live requests.
         cutoff = stamp(utcnow() - timedelta(days=30))
@@ -200,7 +229,7 @@ class Store:
                 AND status IN ('waiting','sent','timed_out','replied') AND created_at>=?
                 ORDER BY (status='waiting') DESC,created_at DESC LIMIT 300""", (cutoff,)).fetchall()
             sender = self.config().get('email', '')
-            return [rec for row in rows if (rec := json.loads(row['data']))['sender_email'] == sender]
+            return [rec for row in rows if (rec := record_data(row['data']))['sender_email'] == sender]
 
     def has_active(self):
         with self.lock:
@@ -213,8 +242,8 @@ class Store:
     def list_records(self, q='', status='', kind='', limit=30, offset=0):
         clauses, args = [], []
         if q:
-            clauses.append("(json_extract(data,'$.subject') LIKE ? OR json_extract(data,'$.body') LIKE ? OR json_extract(data,'$.agent_name') LIKE ? OR id LIKE ? OR json_extract(data,'$.replies') LIKE ?)")
-            args.extend([f'%{q}%'] * 5)
+            clauses.append("(json_extract(data,'$.subject') LIKE ? OR json_extract(data,'$.body') LIKE ? OR json_extract(data,'$.agent_name') LIKE ? OR id LIKE ? OR json_extract(data,'$.replies') LIKE ? OR json_extract(data,'$.ignored_replies') LIKE ?)")
+            args.extend([f'%{q}%'] * 6)
         for field, value in (('status', status), ('kind', kind)):
             if value:
                 clauses.append(f'{field}=?')
@@ -227,4 +256,4 @@ class Store:
             for row in self.db.execute('SELECT status,COUNT(*) AS n FROM records GROUP BY status'):
                 stats[row['status']] = row['n']
                 stats['total'] += row['n']
-            return {'items': [json.loads(row['data']) for row in rows], 'total': total, 'stats': stats}
+            return {'items': [record_data(row['data']) for row in rows], 'total': total, 'stats': stats}

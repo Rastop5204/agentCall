@@ -684,13 +684,19 @@ $("#send-test").addEventListener("click", async () => {
   );
   updateTestButton();
 });
+function latestIgnoredReply(record) {
+  return record.ignored_replies?.at(-1);
+}
 function statusBadge(record) {
   const status = Object.hasOwn(statusNames, record.status)
     ? record.status
     : "queued";
   const waiting = status === "waiting" && record.deadline_at;
   const reconciling = waiting && Date.parse(record.deadline_at) <= Date.now();
-  return `<span class="status-pill ${status}">${icon(statusIcons[status])}<span${waiting ? ` data-wait-status="${escapeHTML(record.deadline_at)}"` : ""}>${reconciling ? "核对最后回复" : statusNames[status]}</span></span>`;
+  const badge = `<span class="status-pill ${status}">${icon(statusIcons[status])}<span${waiting ? ` data-wait-status="${escapeHTML(record.deadline_at)}"` : ""}>${reconciling ? "核对最后回复" : statusNames[status]}</span></span>`;
+  return latestIgnoredReply(record)
+    ? `<span class="status-group">${badge}<span class="status-pill ignored-reply">${icon("alert")}<span>回复未采纳</span></span></span>`
+    : badge;
 }
 function waitingMessage(deadline) {
   const remaining = Math.ceil((Date.parse(deadline) - Date.now()) / 1000);
@@ -710,7 +716,7 @@ function updateCountdowns() {
     if (element.textContent !== label) element.textContent = label;
   });
   $$("[data-wait-message]").forEach((element) => {
-    const message = waitingMessage(element.dataset.waitMessage);
+    const message = `${element.dataset.waitMessagePrefix || ""}${waitingMessage(element.dataset.waitMessage)}`;
     if (element.textContent !== message) element.textContent = message;
   });
 }
@@ -721,8 +727,13 @@ function renderLiveTest(record) {
   state.liveSignature = signature;
   const container = $("#live-test");
   container.hidden = false;
+  const ignoredReply = latestIgnoredReply(record);
+  const ignoredMessage = ignoredReply
+    ? `已收到回复，但未采纳：${ignoredReply.ignored_reason?.message || "该邮件未通过回复校验。"}\n${ignoredReply.ignored_reason?.hint || `请使用配置的目标邮箱 ${record.target_email || ""} 直接回复测试邮件。`}\n`
+    : "";
   let message = "测试邮件正在发送，请稍候。";
-  if (record.status === "waiting") message = waitingMessage(record.deadline_at);
+  if (record.status === "waiting")
+    message = `${ignoredMessage}${waitingMessage(record.deadline_at)}`;
   if (record.status === "replied") {
     message = `已收到你的回复：\n${record.reply?.body || record.replies?.find((reply) => !reply.late)?.body || "（空回复）"}`;
     storage.set("tested", "yes");
@@ -733,19 +744,25 @@ function renderLiveTest(record) {
       ? `${record.error.message} ${record.error.hint || ""}`
       : "测试发送失败，请在记录中查看原因。";
   if (record.status === "timed_out")
-    message = "等待回复已超时。仍会保存晚到的回复，你可以重新发起测试。";
+    message = `${ignoredMessage}等待有效回复已超时。仍会保存晚到的回复，你可以重新发起测试。`;
   if (!$("[data-live-status]", container)) {
     container.innerHTML = `<div data-live-status></div><p data-live-message></p><button class="text-button" type="button" data-record-id="">查看完整记录 ${icon("arrow-up-right")}</button>`;
   }
   $("[data-live-status]", container).innerHTML = statusBadge(record);
   const paragraph = $("[data-live-message]", container);
   paragraph.textContent = message;
+  paragraph.classList.toggle(
+    "warning-text",
+    Boolean(ignoredReply) && ["waiting", "timed_out"].includes(record.status),
+  );
   if (record.status === "waiting" && record.deadline_at) {
     paragraph.dataset.waitMessage = record.deadline_at;
+    paragraph.dataset.waitMessagePrefix = ignoredMessage;
     paragraph.setAttribute("role", "timer");
     paragraph.setAttribute("aria-live", "off");
   } else {
     paragraph.removeAttribute("data-wait-message");
+    paragraph.removeAttribute("data-wait-message-prefix");
     paragraph.removeAttribute("role");
     paragraph.removeAttribute("aria-live");
   }
@@ -885,9 +902,20 @@ function renderRecords() {
   else
     $("#records-list").innerHTML = state.records
       .map((record) => {
+        const ignoredReply = latestIgnoredReply(record);
         const preview =
-          record.error?.message || record.reply?.body || record.body || "";
-        return `<button class="record-row" type="button" data-record-id="${escapeHTML(record.id)}" aria-label="查看记录：${escapeHTML(record.subject || "无主题")}，${escapeHTML(statusNames[record.status] || record.status)}"><span class="record-main"><span class="record-subject">${escapeHTML(record.subject || "无主题")}</span><span class="record-byline">${icon(record.kind === "diagnostic" ? "activity" : "robot")}${escapeHTML(record.agent_name || "Agent")}${record.replies?.some((reply) => reply.late) ? '<span class="late-badge">有晚到回复</span>' : ""}</span><span class="record-preview${record.error ? " error-text" : ""}">${escapeHTML(preview)}</span></span><span class="record-kind">${escapeHTML(kindNames[record.kind] || record.kind)}</span>${statusBadge(record)}<span class="record-time">${escapeHTML(formatDate(record.created_at))}<span>${escapeHTML(new Date(record.created_at).getFullYear())}</span></span><span class="row-chevron">${icon("chevron-right")}</span></button>`;
+          record.error?.message ||
+          record.reply?.body ||
+          record.replies?.find((reply) => !reply.late)?.body ||
+          ignoredReply?.ignored_reason?.message ||
+          record.body ||
+          "";
+        const previewClass = record.error
+          ? " error-text"
+          : ignoredReply && !record.reply && record.status !== "replied"
+            ? " warning-text"
+            : "";
+        return `<button class="record-row" type="button" data-record-id="${escapeHTML(record.id)}" aria-label="查看记录：${escapeHTML(record.subject || "无主题")}，${escapeHTML(statusNames[record.status] || record.status)}${ignoredReply ? "，回复未采纳" : ""}"><span class="record-main"><span class="record-subject">${escapeHTML(record.subject || "无主题")}</span><span class="record-byline">${icon(record.kind === "diagnostic" ? "activity" : "robot")}${escapeHTML(record.agent_name || "Agent")}${record.replies?.some((reply) => reply.late) ? '<span class="late-badge">有晚到回复</span>' : ""}</span><span class="record-preview${previewClass}">${escapeHTML(preview)}</span></span><span class="record-kind">${escapeHTML(kindNames[record.kind] || record.kind)}</span>${statusBadge(record)}<span class="record-time">${escapeHTML(formatDate(record.created_at))}<span>${escapeHTML(new Date(record.created_at).getFullYear())}</span></span><span class="row-chevron">${icon("chevron-right")}</span></button>`;
       })
       .join("");
   $("#record-count").textContent = state.total
@@ -965,6 +993,18 @@ async function openRecord(id) {
 $("#record-dialog").addEventListener("close", () => {
   state.detailId = null;
 });
+function renderIgnoredReplies(record) {
+  if (!record.ignored_replies?.length) return "";
+  return `<section class="detail-section ignored-replies-section">
+    <h3>${icon("alert")}未采纳的回复 · ${record.ignored_replies.length}</h3>
+    <p class="ignored-reply-note">以下邮件已保存，但未计入有效回复。请使用配置的目标邮箱 ${escapeHTML(record.target_email || "")} 直接回复原邮件。</p>
+    ${record.ignored_replies.map((reply) => `<div class="reply-block ignored-reply-block">
+      <div class="reply-meta"><span>${escapeHTML(reply.from_email || "未知发件人")}</span><time datetime="${escapeHTML(reply.received_at)}">${escapeHTML(formatDate(reply.received_at, { year: "numeric", second: "2-digit" }))}</time></div>
+      <div class="ignored-reply-reason"><strong>${escapeHTML(reply.ignored_reason?.message || "该邮件未通过回复校验。")}</strong>${reply.ignored_reason?.hint ? `<p>${escapeHTML(reply.ignored_reason.hint)}</p>` : ""}${reply.ignored_reason?.code ? `<code>原因码：${escapeHTML(reply.ignored_reason.code)}</code>` : ""}</div>
+      <pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre>
+    </div>`).join("")}
+  </section>`;
+}
 function renderDetail(record) {
   if (!$("#record-dialog").open || record.id !== state.detailId) return;
   const signature = JSON.stringify(record);
@@ -1014,7 +1054,7 @@ function renderDetail(record) {
     ["请求编号", `<code>${escapeHTML(record.id)}</code>`],
   ];
   $("#record-detail").innerHTML =
-    `<div class="detail-overview">${statusBadge(record)}<span>${escapeHTML(kindNames[record.kind] || record.kind)}</span></div><dl class="detail-metadata">${metadata.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("")}</dl>${record.error ? `<section class="detail-section"><h3>${icon("alert")}发生的问题</h3><div class="error-box"><strong>${escapeHTML(record.error.message)}</strong>${record.error.hint ? `<p>${escapeHTML(record.error.hint)}</p>` : ""}<code>错误码：${escapeHTML(record.error.code)}</code></div></section>` : ""}<section class="detail-section"><h3>${icon("mail")}发送的消息</h3><pre class="message-body">${escapeHTML(record.body || "（此请求没有正文）")}</pre></section>${replies.length ? `<section class="detail-section"><h3>${icon("message")}收到的回复 · ${replies.length}</h3>${replies.some((reply) => reply.late) ? '<p class="late-note">晚到的回复已保存，不会改变原请求的超时状态。</p>' : ""}${replies.map((reply) => `<div class="reply-block"><div class="reply-meta"><span>${escapeHTML(reply.from_email || record.target_email)}</span><span>${escapeHTML(formatDate(reply.received_at, { second: "2-digit" }))}</span>${reply.late ? '<span class="late-badge">超时后到达</span>' : ""}</div><pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre></div>`).join("")}</section>` : ""}${record.events?.length ? `<section class="detail-section"><h3>${icon("activity")}消息时间线</h3><ol class="timeline">${record.events.map((event) => `<li>${escapeHTML(event.message || event.type)}<time datetime="${escapeHTML(event.at)}">${escapeHTML(formatDate(event.at, { year: "numeric", second: "2-digit" }))}</time></li>`).join("")}</ol></section>` : ""}${["queued", "sending", "waiting"].includes(record.status) ? `<div class="detail-refresh">${icon("refresh")}状态每 5 秒自动更新</div>` : ""}`;
+    `<div class="detail-overview">${statusBadge(record)}<span>${escapeHTML(kindNames[record.kind] || record.kind)}</span></div><dl class="detail-metadata">${metadata.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("")}</dl>${record.error ? `<section class="detail-section"><h3>${icon("alert")}发生的问题</h3><div class="error-box"><strong>${escapeHTML(record.error.message)}</strong>${record.error.hint ? `<p>${escapeHTML(record.error.hint)}</p>` : ""}<code>错误码：${escapeHTML(record.error.code)}</code></div></section>` : ""}${renderIgnoredReplies(record)}<section class="detail-section"><h3>${icon("mail")}发送的消息</h3><pre class="message-body">${escapeHTML(record.body || "（此请求没有正文）")}</pre></section>${replies.length ? `<section class="detail-section"><h3>${icon("message")}收到的回复 · ${replies.length}</h3>${replies.some((reply) => reply.late) ? '<p class="late-note">晚到的回复已保存，不会改变原请求的超时状态。</p>' : ""}${replies.map((reply) => `<div class="reply-block"><div class="reply-meta"><span>${escapeHTML(reply.from_email || record.target_email)}</span><span>${escapeHTML(formatDate(reply.received_at, { second: "2-digit" }))}</span>${reply.late ? '<span class="late-badge">超时后到达</span>' : ""}</div><pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre></div>`).join("")}</section>` : ""}${record.events?.length ? `<section class="detail-section"><h3>${icon("activity")}消息时间线</h3><ol class="timeline">${record.events.map((event) => `<li>${escapeHTML(event.message || event.type)}<time datetime="${escapeHTML(event.at)}">${escapeHTML(formatDate(event.at, { year: "numeric", second: "2-digit" }))}</time></li>`).join("")}</ol></section>` : ""}${["queued", "sending", "waiting"].includes(record.status) ? `<div class="detail-refresh">${icon("refresh")}状态每 5 秒自动更新</div>` : ""}`;
 }
 
 async function connect() {
