@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import ssl
+import sqlite3
 import sys
 import threading
 import time
@@ -507,8 +508,13 @@ class WechatGateway:
         elif event == "message":
             try:
                 self.on_message(payload)
-            except Exception:
-                error = WechatError("WECHAT_REPLY_SAVE_FAILED", "微信回复未能保存。", "请检查数据目录权限和磁盘空间。", True)
+            except Exception as exc:
+                storage_error = isinstance(exc, (sqlite3.Error, OSError))
+                hint = ('请检查数据目录权限和磁盘空间。' if storage_error else
+                        '处理回复数据时发生内部错误，请更新服务或查看诊断记录；这不一定是磁盘或权限问题。')
+                # Do not log exception text: it may contain reply text or IDs.
+                logging.getLogger(__name__).error('WeChat reply save failed (%s)', type(exc).__name__)
+                error = WechatError("WECHAT_REPLY_SAVE_FAILED", "微信回复未能保存。", hint, True)
                 self._set(error=error.as_dict())
                 self._report("reply_save_failed", error)
 

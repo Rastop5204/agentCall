@@ -81,6 +81,18 @@ class WechatGatewayTests(unittest.TestCase):
         self.assertFalse(status["logged_in"])
         self.assertNotIn("secret", str(status))
 
+    def test_reply_processing_error_does_not_blame_disk_or_log_message(self):
+        def fail(_):
+            raise ValueError('private reply content')
+        self.gateway.on_message = fail
+        with self.assertLogs('gateway.wechat', level='ERROR') as logs:
+            self.gateway._event('message', {})
+        self.assertNotIn('private reply content', str(logs.output))
+        self.assertIn('ValueError', str(logs.output))
+        error = self.gateway.status()['error']
+        self.assertEqual(error['code'], 'WECHAT_REPLY_SAVE_FAILED')
+        self.assertIn('内部错误', error['hint'])
+
     def test_login_rejection_remains_visible_after_failed_health_probes(self):
         self.client.account = None
         self.gateway._event('login_failed', {'return_code': '1203'})

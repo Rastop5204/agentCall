@@ -288,6 +288,9 @@ class Store:
             received = datetime.fromisoformat(item['received_at'].replace('Z', '+00:00'))
             if received.tzinfo is None or received > utcnow() + timedelta(seconds=30):
                 return False
+            # SDK events use UTC "Z". Python 3.10's fromisoformat() (used
+            # again by add_reply) requires an explicit offset instead.
+            item['received_at'] = received.isoformat()
         except ValueError:
             return False
         with self.lock, self.db:

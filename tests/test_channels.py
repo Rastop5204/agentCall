@@ -130,6 +130,32 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(stored['reply']['channel'], 'wechat')
         self.assertEqual(len(stored['replies']), 1)
 
+    def test_sdk_utc_z_reply_survives_save_and_restart(self):
+        record = self.create()
+        self.app.send_once()
+        received = datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+        self.assertTrue(self.incoming(record, received_at=received))
+        self.assertFalse(self.incoming(record, received_at=received))
+        self.store.close()
+        self.store = Store(self.tmp.name)
+        saved = self.store.get(record['id'])
+        self.assertEqual(saved['status'], 'replied')
+        self.assertEqual(saved['reply']['body'], '选择 A')
+        self.assertEqual(len(saved['replies']), 1)
+        self.assertEqual(datetime.fromisoformat(saved['reply']['received_at']),
+                         datetime.fromisoformat(received.replace('Z', '+00:00')))
+
+    def test_sdk_utc_z_reply_after_deadline_remains_late(self):
+        record = self.create(timeout_seconds=30)
+        self.app.send_once()
+        deadline = datetime.fromisoformat(self.store.get(record['id'])['deadline_at'])
+        received = deadline + timedelta(seconds=1)
+        with unittest.mock.patch('gateway.store.utcnow', return_value=received):
+            self.assertTrue(self.incoming(record, received_at=received.isoformat().replace('+00:00', 'Z')))
+        saved = self.store.get(record['id'])
+        self.assertEqual(saved['status'], 'waiting')
+        self.assertTrue(saved['reply']['late'])
+
     def test_wrong_account_or_contact_cannot_complete_request(self):
         record = self.create()
         self.app.send_once()
