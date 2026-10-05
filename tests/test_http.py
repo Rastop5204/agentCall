@@ -73,10 +73,48 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('/api/config', headers={'Cookie': cookie})[0], 401)
         self.assertEqual(self.request('/api/config', headers={'Cookie': cookie, 'X-CSRF-Token': data['csrf_token']})[0], 200)
 
+    def test_inbox_requires_auth_and_agent_cannot_enable_mode(self):
+        agent = {'Authorization': 'Bearer ' + self.store.token()}
+        self.assertEqual(self.request('/api/inbox')[0], 401)
+        self.assertEqual(self.request('/api/inbox', headers=agent)[0], 200)
+        self.assertEqual(self.request('/api/efficient-mode', headers=agent)[0], 200)
+        self.assertEqual(self.request('/api/efficient-mode', 'PUT', {'enabled': True}, agent)[0], 403)
+        self.assertEqual(self.request('/api/inbox/claim', 'POST', {'consumer_id': 'session-1'}, agent)[0], 409)
+        for path in ('/api/inbox?limit=0', '/api/inbox?limit=51', '/api/inbox?limit=nan'):
+            self.assertEqual(self.request(path, headers=agent)[0], 422)
+
     def test_cross_origin_and_rebinding_hosts_rejected(self):
         self.assertEqual(self.request('/api/session', headers={'Origin': 'https://evil.example'})[0], 403)
         self.assertEqual(self.request('/api/health', headers={'Host': 'evil.example'})[0], 403)
         self.assertEqual(self.request('/api/session', headers={'Sec-Fetch-Site': 'cross-site'})[0], 403)
+
+    def test_live_http_long_poll_capture_and_explicit_ack(self):
+        from tests.test_channels import FakeWechat
+        from gateway.store import stamp
+        import time
+        self.app.channels.wechat = FakeWechat()
+        self.app.save_wechat_config({'enabled': True, 'target_contact_id': 'user-1'})
+        _, headers, session = self.request('/api/session')
+        ui = {'Cookie': headers['Set-Cookie'].split(';')[0], 'X-CSRF-Token': session['csrf_token']}
+        self.assertEqual(self.request('/api/efficient-mode', 'PUT', {'enabled': True}, ui)[0], 200)
+        agent = {'Authorization': 'Bearer ' + self.store.token()}
+        data = {'consumer_id': 'codex-session-http', 'wait': 2}
+        result = []
+        listener = threading.Thread(target=lambda: result.append(self.request('/api/inbox/claim', 'POST', data, agent)))
+        listener.start()
+        time.sleep(.05)
+        self.app.receive_wechat({'message_id': 'http-incoming', 'from_contact_id': 'user-1',
+            'account_id': 'bot-1', 'body': '新指令', 'received_at': stamp()})
+        listener.join(3)
+        self.assertFalse(listener.is_alive())
+        self.assertEqual(result[0][0], 200)
+        event = result[0][2]['items'][0]
+        self.assertEqual(event['body'], '新指令')
+        self.assertEqual(self.store.get(event['record_id'])['status'], 'received')
+        ack = {'consumer_id': data['consumer_id'], 'ids': [event['id']]}
+        self.assertEqual(self.request('/api/inbox/ack', 'POST', ack, agent)[0], 200)
+        self.assertEqual(self.store.get(event['record_id'])['status'], 'read')
+        self.assertEqual(self.request('/api/inbox', headers=agent)[2]['items'], [])
 
     def test_agent_can_create_and_inspect_recorded_failure(self):
         headers = {'Authorization': 'Bearer '+self.store.token(), 'Idempotency-Key': 'request-id-123'}

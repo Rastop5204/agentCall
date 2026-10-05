@@ -112,6 +112,7 @@ class Channels:
             if active and config != old:
                 raise APIError('REQUESTS_ACTIVE', '仍有正在发送或等待回复的请求。', '请等待请求结束后再修改微信配置。', 409)
             self.store.set_setting('wechat_config', config)
+            self.store.changed.notify_all()
         connection_changed = any(config[k] != old[k] for k in ('enabled', 'mode', 'service_endpoint', 'service_token'))
         if connection_changed:
             self.wechat.stop()

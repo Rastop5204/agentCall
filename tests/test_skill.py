@@ -43,6 +43,36 @@ class SkillClientTests(unittest.TestCase):
         self.assertEqual(client.request.call_args_list[0].args, ("GET", "/api/channels"))
         self.assertEqual(client.request.call_args_list[1].args[:2], ("POST", "/api/notify"))
 
+    def test_inbox_stops_on_message_without_acknowledging_automatically(self):
+        client = mock.Mock()
+        client.request.side_effect = [{'selected_channel': 'wechat'},
+            {'items': [], 'mode': {'enabled': True}},
+            {'items': [{'id': 3, 'kind': 'message', 'body': '新要求'}], 'mode': {'enabled': True}}]
+        with mock.patch.object(self.cli, 'load_config', return_value={}), \
+                mock.patch.object(self.cli, 'Client', return_value=client), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.cli.main(['inbox', '--consumer-id', 'session-123', '--wait-seconds', '30']), 0)
+        calls = client.request.call_args_list
+        self.assertEqual(calls[0].args, ('GET', '/api/channels'))
+        self.assertEqual(calls[1].args[2]['consumer_id'], 'session-123')
+        self.assertFalse(any('/ack' in call.args[1] for call in calls))
+        result = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(result['items'][0]['body'], '新要求')
+        self.assertTrue(result['ack_required'])
+
+    def test_inbox_zero_wait_and_explicit_ack(self):
+        for command, replies, expected in [
+            (['inbox', '--consumer-id', 'session-123'], [{'selected_channel': 'wechat'}, {'items': []}], '/api/inbox/claim'),
+            (['ack', '--consumer-id', 'session-123', '3'], [{'selected_channel': 'wechat'}, {'acked': [3]}], '/api/inbox/ack'),
+            (['mode'], [{'selected_channel': 'wechat'}, {'enabled': True}], '/api/efficient-mode')]:
+            client = mock.Mock()
+            client.request.side_effect = replies
+            with mock.patch.object(self.cli, 'load_config', return_value={}), \
+                    mock.patch.object(self.cli, 'Client', return_value=client), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.cli.main(command), 0)
+            self.assertEqual(client.request.call_args_list[-1].args[1], expected)
+
     def test_explicit_wechat_test_keeps_channel_choice_in_request(self):
         client = mock.Mock()
         client.request.side_effect = [{"selected_channel": "email", "available": True},

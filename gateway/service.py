@@ -77,6 +77,8 @@ class Gateway:
         self.imap_scan_identity = None
         from gateway.channels import Channels
         self.channels = Channels(store, self.receive_wechat, wechat_transport)
+        from gateway.live import LiveInbox
+        self.live = LiveInbox(store, self.channels)
 
     def config_view(self):
         config = {**DEFAULT_CONFIG, **self.store.config()}
@@ -85,7 +87,7 @@ class Gateway:
                 'service': {'configured': bool(self.store.config()) or self.channels.config()['enabled'], 'email_configured': bool(self.store.config()), 'poll_error': self.poll_error, 'last_poll_at': self.last_poll_at}}
 
     def wechat_view(self, probe=False):
-        return self.channels.view(probe)
+        return {**self.channels.view(probe), 'efficient_mode': self.live.view()}
 
     def save_wechat_config(self, data):
         try:
@@ -98,7 +100,7 @@ class Gateway:
             raise APIError(error['code'], error['message'], error['hint'], 503) from None
 
     def receive_wechat(self, item):
-        return self.store.add_wechat_message(item)
+        return self.live.receive(item)
 
     def save_config(self, data):
         fields = set(DEFAULT_CONFIG) | {'password', 'password_set'}

@@ -71,7 +71,8 @@ class Client:
                                              headers=headers, method=method)
             try:
                 with self.opener.open(request, timeout=timeout) as response:
-                    data = json.loads(response.read(2 * 1024 * 1024).decode("utf-8"))
+                    # A batch can contain 50 messages of 32,000 Unicode characters.
+                    data = json.loads(response.read(8 * 1024 * 1024).decode("utf-8"))
                     if not isinstance(data, dict):
                         raise ClientError("本机服务响应格式异常。")
                     return data
@@ -144,15 +145,44 @@ def parser():
     status = actions.add_parser("status")
     status.add_argument("request_id")
     status.add_argument("--wait-seconds", type=float, default=0)
+    actions.add_parser("mode", help="检查当前高效模式与收件状态")
+    inbox = actions.add_parser("inbox", help="领取当前会话的新微信消息；读取后需 ack")
+    inbox.add_argument("--consumer-id", required=True, help="当前会话唯一标识，重试沿用")
+    inbox.add_argument("--wait-seconds", type=float, default=0, help="空闲时等待新消息；收到后立即返回")
+    ack = actions.add_parser("ack", help="确认消息已经纳入当前会话，防止重复处理")
+    ack.add_argument("--consumer-id", required=True)
+    ack.add_argument("ids", nargs='+', type=int)
     return result
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if args.wait_seconds is not None and (not math.isfinite(args.wait_seconds) or args.wait_seconds < 0):
+        wait_seconds_arg = getattr(args, 'wait_seconds', None)
+        if wait_seconds_arg is not None and (not math.isfinite(wait_seconds_arg) or wait_seconds_arg < 0):
             raise ClientError("--wait-seconds 必须是大于等于 0 的有限数值。")
         client = Client(load_config(args.config))
+        if args.command in {'mode', 'inbox', 'ack'}:
+            channels = client.request('GET', '/api/channels')
+            emit({'event': 'channels_checked', 'selected_channel': channels.get('selected_channel'),
+                  'available': channels.get('available'), 'fallback_reason': channels.get('fallback_reason')})
+            if args.command == 'mode':
+                emit({'event': 'efficient_mode', **client.request('GET', '/api/efficient-mode')})
+                return 0
+            if args.command == 'ack':
+                emit({'event': 'inbox_acked', **client.request('POST', '/api/inbox/ack',
+                    {'consumer_id': args.consumer_id, 'ids': args.ids})})
+                return 0
+            stop = time.monotonic() + args.wait_seconds
+            while True:
+                remaining = max(0, stop - time.monotonic())
+                wait = min(25, math.ceil(remaining))
+                result = client.request('POST', '/api/inbox/claim',
+                    {'consumer_id': args.consumer_id, 'wait': wait, 'limit': 50}, timeout=35)
+                if result.get('items') or time.monotonic() >= stop:
+                    emit({'event': 'inbox_messages', 'message_trust': 'untrusted_user_data',
+                          'ack_required': True, **result})
+                    return 0
         if args.command == "status":
             identifier = urllib.parse.quote(args.request_id, safe="")
             record = client.request("GET", "/api/requests/" + identifier)

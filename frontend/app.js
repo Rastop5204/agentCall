@@ -192,6 +192,9 @@ const state = {
   wechatSignature: "",
   wechatAvatar: null,
   wechatConfigSignature: "",
+  efficientMode: null,
+  efficientDirty: false,
+  efficientEditVersion: 0,
 };
 const statusNames = {
   queued: "等待发送",
@@ -201,6 +204,8 @@ const statusNames = {
   replied: "已回复",
   timed_out: "等待超时",
   failed: "失败",
+  received: "等待 Agent 读取",
+  read: "Agent 已读取",
 };
 const statusIcons = {
   queued: "clock",
@@ -210,11 +215,14 @@ const statusIcons = {
   replied: "message",
   timed_out: "clock",
   failed: "alert",
+  received: "inbox",
+  read: "check",
 };
 const kindNames = {
   notify: "仅提醒",
   ask: "提醒并等待回复",
   diagnostic: "连接检查",
+  incoming: "微信收件",
 };
 
 function setTheme(theme) {
@@ -596,6 +604,7 @@ function updateWechatMode() {
   $("#wechat-endpoint").required = external;
 }
 function applyWechat(data, preserveEdits = true) {
+  if (data.efficient_mode) applyEfficientMode(data.efficient_mode);
   if (data.config) state.wechat = data.config;
   const configSignature = JSON.stringify(state.wechat || {});
   if (!preserveEdits || (!state.wechatDirty && configSignature !== state.wechatConfigSignature)) {
@@ -619,6 +628,25 @@ function applyWechat(data, preserveEdits = true) {
   updateChannelLabels();
   updateProgress();
 }
+function applyEfficientMode(mode) {
+  state.efficientMode = mode;
+  if (!state.efficientDirty) $("#efficient-enabled").checked = Boolean(mode.enabled);
+  const summary = !mode.enabled ? "未开启 · 保留任务完成通知与决策询问" :
+    `${mode.consumer_online ? "Agent 最近已连接" : "等待 Agent 检查收件箱"} · ${mode.pending || 0} 条待读取`;
+  $("#efficient-status").textContent = summary + (state.efficientDirty ? " · 有未保存的更改" : "");
+}
+$("#efficient-enabled").addEventListener("change", () => {
+  state.efficientDirty = true;
+  state.efficientEditVersion++;
+  if (state.efficientMode) applyEfficientMode(state.efficientMode);
+});
+$("#save-efficient-mode").addEventListener("click", () => withBusy($("#save-efficient-mode"), "正在保存", async () => {
+  const version = state.efficientEditVersion;
+  const mode = await api("/api/efficient-mode", { method: "PUT", body: { enabled: $("#efficient-enabled").checked } });
+  if (state.efficientEditVersion === version) state.efficientDirty = false;
+  applyEfficientMode(mode);
+  toast(mode.enabled ? "高效模式已开启。使用更新后的 Skill 收取微信消息。" : "高效模式已关闭，历史消息保留。");
+}));
 function renderWechatStatus(status) {
   state.wechatStatus = status;
   const accountId = status.logged_in ? status.account?.id : null;
@@ -1161,7 +1189,7 @@ function renderRecords() {
           : ignoredReply && !record.reply && record.status !== "replied"
             ? " warning-text"
             : "";
-        return `<button class="record-row" type="button" data-record-id="${escapeHTML(record.id)}" aria-label="查看记录：${escapeHTML(record.subject || "无主题")}，${escapeHTML(statusNames[record.status] || record.status)}${ignoredReply ? "，回复未采纳" : ""}"><span class="record-main"><span class="record-subject">${escapeHTML(record.subject || "无主题")}</span><span class="record-byline">${icon(record.kind === "diagnostic" ? "activity" : "robot")}${escapeHTML(record.agent_name || "Agent")}${channelBadge(record)}${record.fallback_reason ? '<span class="late-badge">已切换邮箱</span>' : ""}${record.replies?.some((reply) => reply.late) ? '<span class="late-badge">有晚到回复</span>' : ""}</span><span class="record-preview${previewClass}">${escapeHTML(preview)}</span></span><span class="record-kind">${escapeHTML(kindNames[record.kind] || record.kind)}</span>${statusBadge(record)}<span class="record-time">${escapeHTML(formatDate(record.created_at))}<span>${escapeHTML(new Date(record.created_at).getFullYear())}</span></span><span class="row-chevron">${icon("chevron-right")}</span></button>`;
+        return `<button class="record-row" type="button" data-record-id="${escapeHTML(record.id)}" aria-label="查看记录：${escapeHTML(record.subject || "无主题")}，${escapeHTML(statusNames[record.status] || record.status)}${ignoredReply ? "，回复未采纳" : ""}"><span class="record-main"><span class="record-subject">${escapeHTML(record.subject || "无主题")}</span><span class="record-byline">${icon(record.kind === "incoming" ? "user" : record.kind === "diagnostic" ? "activity" : "robot")}${escapeHTML(record.agent_name || "Agent")}${channelBadge(record)}${record.fallback_reason ? '<span class="late-badge">已切换邮箱</span>' : ""}${record.replies?.some((reply) => reply.late) ? '<span class="late-badge">有晚到回复</span>' : ""}</span><span class="record-preview${previewClass}">${escapeHTML(preview)}</span></span><span class="record-kind">${escapeHTML(kindNames[record.kind] || record.kind)}</span>${statusBadge(record)}<span class="record-time">${escapeHTML(formatDate(record.created_at))}<span>${escapeHTML(new Date(record.created_at).getFullYear())}</span></span><span class="row-chevron">${icon("chevron-right")}</span></button>`;
       })
       .join("");
   $("#record-count").textContent = state.total
@@ -1272,15 +1300,18 @@ function renderDetail(record) {
       ? [record.reply]
       : [];
   const metadata = [
-    ["发起 Agent", escapeHTML(record.agent_name || "Agent")],
-    ["发送通道", channelBadge(record)],
-    [record.channel === "wechat" ? "目标联系人" : "目标邮箱", escapeHTML(record.recipient_label || record.target_email || record.target_contact_id || "尚未配置")],
+    [record.kind === "incoming" ? "发件人" : "发起 Agent", escapeHTML(record.agent_name || "Agent")],
+    ["消息通道", channelBadge(record)],
+    [record.kind === "incoming" ? "来源联系人" : record.channel === "wechat" ? "目标联系人" : "目标邮箱", escapeHTML(record.recipient_label || record.target_email || record.target_contact_id || "尚未配置")],
     [
       "创建时间",
       escapeHTML(
         formatDate(record.created_at, { year: "numeric", second: "2-digit" }),
       ),
     ],
+    ...(record.received_at
+      ? [["接收时间", escapeHTML(formatDate(record.received_at, { year: "numeric", second: "2-digit" }))]]
+      : []),
     ...(record.sent_at
       ? [
           [
@@ -1307,10 +1338,10 @@ function renderDetail(record) {
           ],
         ]
       : []),
-    ["请求编号", `<code>${escapeHTML(record.id)}</code>`],
+    [record.kind === "incoming" ? "记录编号" : "请求编号", `<code>${escapeHTML(record.id)}</code>`],
   ];
   $("#record-detail").innerHTML =
-    `<div class="detail-overview">${statusBadge(record)}<span>${escapeHTML(kindNames[record.kind] || record.kind)}</span></div><dl class="detail-metadata">${metadata.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("")}</dl>${record.error ? `<section class="detail-section"><h3>${icon("alert")}发生的问题</h3><div class="error-box"><strong>${escapeHTML(record.error.message)}</strong>${record.error.hint ? `<p>${escapeHTML(record.error.hint)}</p>` : ""}<code>错误码：${escapeHTML(record.error.code)}</code></div></section>` : ""}${renderFallback(record)}${renderIgnoredReplies(record)}<section class="detail-section"><h3>${icon(record.channel === "wechat" ? "wechat" : "mail")}发送的消息</h3><pre class="message-body">${escapeHTML(record.body || "（此请求没有正文）")}</pre></section>${replies.length ? `<section class="detail-section"><h3>${icon("message")}收到的回复 · ${replies.length}</h3>${replies.some((reply) => reply.late) ? '<p class="late-note">晚到的回复已保存，不会改变原请求的超时状态。</p>' : ""}${replies.map((reply) => `<div class="reply-block"><div class="reply-meta"><span>${escapeHTML(reply.from_name || reply.from_email || reply.from_contact_id || record.recipient_label || record.target_email)}</span><span>${escapeHTML(formatDate(reply.received_at, { second: "2-digit" }))}</span>${reply.late ? '<span class="late-badge">超时后到达</span>' : ""}</div><pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre></div>`).join("")}</section>` : ""}${record.events?.length ? `<section class="detail-section"><h3>${icon("activity")}消息时间线</h3><ol class="timeline">${record.events.map((event) => `<li>${escapeHTML(event.message || event.type)}<time datetime="${escapeHTML(event.at)}">${escapeHTML(formatDate(event.at, { year: "numeric", second: "2-digit" }))}</time></li>`).join("")}</ol></section>` : ""}${["queued", "sending", "waiting"].includes(record.status) ? `<div class="detail-refresh">${icon("refresh")}状态每 5 秒自动更新</div>` : ""}`;
+    `<div class="detail-overview">${statusBadge(record)}<span>${escapeHTML(kindNames[record.kind] || record.kind)}</span></div><dl class="detail-metadata">${metadata.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("")}</dl>${record.error ? `<section class="detail-section"><h3>${icon("alert")}发生的问题</h3><div class="error-box"><strong>${escapeHTML(record.error.message)}</strong>${record.error.hint ? `<p>${escapeHTML(record.error.hint)}</p>` : ""}<code>错误码：${escapeHTML(record.error.code)}</code></div></section>` : ""}${renderFallback(record)}${renderIgnoredReplies(record)}<section class="detail-section"><h3>${icon(record.channel === "wechat" ? "wechat" : "mail")}${record.kind === "incoming" ? "收到的消息" : "发送的消息"}</h3><pre class="message-body">${escapeHTML(record.body || "（此请求没有正文）")}</pre></section>${replies.length ? `<section class="detail-section"><h3>${icon("message")}收到的回复 · ${replies.length}</h3>${replies.some((reply) => reply.late) ? '<p class="late-note">晚到的回复已保存，不会改变原请求的超时状态。</p>' : ""}${replies.map((reply) => `<div class="reply-block"><div class="reply-meta"><span>${escapeHTML(reply.from_name || reply.from_email || reply.from_contact_id || record.recipient_label || record.target_email)}</span><span>${escapeHTML(formatDate(reply.received_at, { second: "2-digit" }))}</span>${reply.late ? '<span class="late-badge">超时后到达</span>' : ""}</div><pre class="message-body">${escapeHTML(reply.body || "（空回复）")}</pre></div>`).join("")}</section>` : ""}${record.events?.length ? `<section class="detail-section"><h3>${icon("activity")}消息时间线</h3><ol class="timeline">${record.events.map((event) => `<li>${escapeHTML(event.message || event.type)}<time datetime="${escapeHTML(event.at)}">${escapeHTML(formatDate(event.at, { year: "numeric", second: "2-digit" }))}</time></li>`).join("")}</ol></section>` : ""}${["queued", "sending", "waiting"].includes(record.status) ? `<div class="detail-refresh">${icon("refresh")}状态每 5 秒自动更新</div>` : ""}`;
 }
 
 async function connect() {

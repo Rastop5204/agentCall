@@ -176,6 +176,40 @@ async function testWechatConnectionDiagnosticsWithoutTarget() {
  await h.elements.get('#test-connection').listeners.click();
  assert.equal(calls.length,1,'Unsaved changes must not silently test the old configuration');
 }
+async function testEfficientModeAndIncomingRecords() {
+ const h=harness();
+ h.get('applyEfficientMode({enabled:false,pending:0})');
+ const toggle=h.elements.get('#efficient-enabled');
+ toggle.checked=true; toggle.listeners.change();
+ h.get('applyEfficientMode({enabled:false,pending:2})');
+ assert.equal(toggle.checked,true,'Polling must preserve unsaved mode edits');
+ assert.match(h.elements.get('#efficient-status').textContent,/未保存/);
+ let finish;
+ h.context.handler=(path,options)=>{
+  assert.equal(path,'/api/efficient-mode'); assert.equal(options.method,'PUT');
+  assert.equal(options.body.enabled,true);
+  return new Promise(resolve=>{finish=resolve;});
+ };
+ h.get('api=handler');
+ const saving=h.elements.get('#save-efficient-mode').listeners.click();
+ toggle.checked=false; toggle.listeners.change();
+ finish({enabled:true,pending:2,consumer_online:true}); await saving;
+ assert.equal(toggle.checked,false,'Edits made while saving must survive response');
+ assert.equal(h.get('state.efficientDirty'),true);
+ assert.match(h.elements.get('#efficient-status').textContent,/最近已连接.*2.*未保存/);
+ h.context.record={id:'incoming-1',kind:'incoming',status:'received',channel:'wechat',
+  agent_name:'User <img>',subject:'来自微信的消息',body:'New instruction <script>',created_at:new Date().toISOString()};
+ h.elements.get('#record-dialog').open=true;
+ h.get('state.detailId=record.id;renderDetail(record);state.records=[record];state.total=1;renderRecords()');
+ assert.match(h.elements.get('#record-detail').innerHTML,/发件人.*User &lt;img&gt;/);
+ assert.match(h.elements.get('#record-detail').innerHTML,/收到的消息.*New instruction &lt;script&gt;/);
+ assert.doesNotMatch(h.elements.get('#record-detail').innerHTML,/<img>|<script>/);
+ assert.match(h.elements.get('#records-list').innerHTML,/微信收件/);
+ assert.match(h.elements.get('#records-list').innerHTML,/等待 Agent 读取/);
+ h.get('record.status="read";renderRecords()');
+ assert.match(h.elements.get('#records-list').innerHTML,/Agent 已读取/);
+ console.log('PASS: efficient mode preserves unsaved edits and save races; incoming messages render safely with separate receipt/read states.');
+}
 (async()=>{
  const first=harness(); const calls=[];
  first.context.handler=async(path,options)=>{if(path==='/api/config')return {config};calls.push(options);throw new Error('Lost HTTP response after request persisted');};
@@ -194,6 +228,7 @@ async function testWechatConnectionDiagnosticsWithoutTarget() {
  await testWechatAvatar();
  await testWechatRequestAndRecords();
  await testWechatConnectionDiagnosticsWithoutTarget();
+ await testEfficientModeAndIncomingRecords();
  console.log('PASS: lost-response retry reuses key/payload across reload; success clears pending; 422 clears pending; changed saved config prevents resend; deadline reconciliation copy.');
  console.log('PASS: ignored replies expose reasons safely, preserve original status, survive countdown/timeout, and yield to accepted replies or errors.');
  console.log('PASS: WeChat configuration preserves edits and secret fields; QR stays local; contacts/replies escape HTML; channel-specific requests and legacy email records render correctly.');

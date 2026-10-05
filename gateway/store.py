@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -83,8 +84,23 @@ class Store:
             return json.loads(row['value']) if row else default
 
     def set_setting(self, key, value):
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, json.dumps(value)))
+
+    @contextmanager
+    def transaction(self):
+        """Nested writes must commit with their caller, including inbox capture."""
+        with self.lock:
+            name = 'write_' + uuid.uuid4().hex
+            self.db.execute('SAVEPOINT ' + name)
+            try:
+                yield
+            except BaseException:
+                self.db.execute('ROLLBACK TO ' + name)
+                self.db.execute('RELEASE ' + name)
+                raise
+            else:
+                self.db.execute('RELEASE ' + name)
 
     def config(self):
         return self.setting('config', {})
@@ -119,7 +135,7 @@ class Store:
     def insert(self, kind, payload, config, key=None, fingerprint=None, error=None):
         request_id = uuid.uuid4().hex
         now = stamp()
-        initial_status = 'failed' if error else ('sent' if kind == 'diagnostic' else 'queued')
+        initial_status = 'failed' if error else ('received' if kind == 'incoming' else 'sent' if kind == 'diagnostic' else 'queued')
         record = dict(id=request_id, kind=kind, subject=payload.get('subject', ''), body=payload.get('body', ''),
                       agent_name=payload.get('agent_name', 'Agent'), target_email=config.get('target_email', ''),
                       sender_email=config.get('email', ''), status=initial_status,
@@ -132,15 +148,15 @@ class Store:
                       recipient_label=payload.get('_recipient_label') or config.get('target_email', ''),
                       fallback_reason=payload.get('_fallback_reason'), transport_message_id=None,
                       ignored_replies=[], events=[])
-        self._event(record, record['status'], error['message'] if error else ('邮箱连接检查完成。' if kind == 'diagnostic' else '请求已保存，等待发送。'))
-        with self.lock, self.db:
+        self._event(record, record['status'], error['message'] if error else ('收到微信消息，等待 Agent 读取。' if kind == 'incoming' else '邮箱连接检查完成。' if kind == 'diagnostic' else '请求已保存，等待发送。'))
+        with self.lock, self.transaction():
             self.db.execute('INSERT INTO records VALUES (?,?,?,?,?,?,?)',
                             (request_id, kind, record['status'], now, json.dumps(record, ensure_ascii=False), key, fingerprint))
             self.changed.notify_all()
         return record
 
     def claim_next(self):
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             row = self.db.execute("SELECT data FROM records WHERE status='queued' AND kind IN ('ask','notify') ORDER BY created_at LIMIT 1").fetchone()
             if not row:
                 return None
@@ -154,7 +170,7 @@ class Store:
             return record
 
     def set_route(self, request_id, channel, fallback_reason=None):
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             record = self.get(request_id)
             record['channel'], record['fallback_reason'] = channel, fallback_reason
             record['recipient_label'] = record.get('target_contact_name', record['recipient_label']) if channel == 'wechat' else record['target_email']
@@ -165,7 +181,7 @@ class Store:
             return record
 
     def mark_sent(self, request_id, transport_message_id=None):
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             record = self.get(request_id)
             timely_reply = record['reply'] and not record['reply'].get('late')
             record['status'] = ('replied' if timely_reply else 'waiting') if record['kind'] == 'ask' else 'sent'
@@ -177,7 +193,7 @@ class Store:
             self._save(record)
 
     def fail(self, request_id, error):
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             record = self.get(request_id)
             record['status'], record['error'] = 'failed', error
             self._event(record, 'failed', error['message'])
@@ -193,7 +209,7 @@ class Store:
 
     def expire(self, now=None, mailbox_checked=False):
         now = now or utcnow()
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             for row in self.db.execute("SELECT data FROM records WHERE status='waiting'").fetchall():
                 record = record_data(row['data'])
                 deadline = datetime.fromisoformat(record['deadline_at'])
@@ -213,7 +229,7 @@ class Store:
             return interval
 
     def add_reply(self, item):
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             record = self.get(item['request_id'])
             if not record or item.get('ignored_reason'):
                 return False
@@ -247,7 +263,7 @@ class Store:
 
     def add_ignored_reply(self, item):
         """Keep rejected thread matches visible without treating them as user decisions."""
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             record = self.get(item['request_id'])
             if not record or not item.get('ignored_reason'):
                 return False
@@ -275,7 +291,7 @@ class Store:
             sender = self.config().get('email', '')
             return [rec for row in rows if (rec := record_data(row['data']))['sender_email'] == sender]
 
-    def add_wechat_message(self, item):
+    def add_wechat_message(self, item, *, capture_unmatched=False):
         """Correlate only one-to-one replies to the snapshotted account/contact.
 
         A plain reply can answer exactly one live question. Parallel questions
@@ -293,7 +309,7 @@ class Store:
             item['received_at'] = received.isoformat()
         except ValueError:
             return False
-        with self.lock, self.db:
+        with self.lock, self.transaction():
             if self.db.execute('SELECT 1 FROM wechat_inbox WHERE account_id=? AND message_id=?', (item['account_id'], item['message_id'])).fetchone():
                 return False
             tokens = set(re.findall(r'\[(?:AC|EC):([A-Za-z0-9_-]+)\]', item['body']))
@@ -343,13 +359,15 @@ class Store:
                 else:
                     item['body'] = re.sub(r'\[(?:AC|EC):' + re.escape(record['id']) + r'\]', '', item['body']).strip()
                     saved = bool(item['body']) and self.add_reply(item)
-            elif related:
+            elif related and not capture_unmatched:
                 self.diagnostic([{'name': '微信回复匹配', 'ok': False, 'error': dict(code='WECHAT_REPLY_AMBIGUOUS' if len(matches) > 1 or conflicting else 'WECHAT_REPLY_UNMATCHED',
                     message='收到目标联系人的微信消息，但无法安全确定回复归属，已保存且未作为决策。',
                     hint='请在回复中保留对应问题的 [AC:请求编号]。回复内容：' + item['body'])}], channel='wechat')
                 saved = False
-            else:
+            elif not capture_unmatched:
                 return False
+            else:
+                saved = False
             self.db.execute('INSERT INTO wechat_inbox VALUES (?,?,?)', (item['account_id'], item['message_id'], item['received_at']))
             return saved
 

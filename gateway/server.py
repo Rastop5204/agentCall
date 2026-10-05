@@ -54,7 +54,7 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'agentCall/2.0'
+    server_version = 'agentCall/' + __version__
     sys_version = ''
 
     def setup(self):
@@ -190,11 +190,24 @@ class Handler(BaseHTTPRequestHandler):
                                       'configured': bool(app.store.config()) or app.channels.config()['enabled']})
         if method == 'GET' and path == '/api/session':
             return self.session()
-        agent_route = path in ('/api/notify', '/api/ask', '/api/channels') or path.startswith('/api/requests/')
+        agent_route = path in ('/api/notify', '/api/ask', '/api/channels', '/api/efficient-mode',
+                              '/api/inbox', '/api/inbox/claim', '/api/inbox/ack') or path.startswith('/api/requests/')
+        if method != 'GET' and path == '/api/efficient-mode':
+            agent_route = False
         self.authenticate(ui_only=not agent_route)
         if method == 'GET':
             if path == '/api/channels':
-                return self.respond(200, app.channels.selection())
+                return self.respond(200, {**app.channels.selection(), 'efficient_mode': app.live.view()})
+            if path == '/api/efficient-mode':
+                return self.respond(200, app.live.view())
+            if path == '/api/inbox':
+                try:
+                    limit = int(query.get('limit', ['50'])[0])
+                    if not 1 <= limit <= 50:
+                        raise ValueError()
+                except ValueError:
+                    raise APIError('INVALID_INPUT', 'limit 必须在 1–50 之间。')
+                return self.respond(200, app.live.peek(limit))
             if path == '/api/wechat':
                 return self.respond(200, app.wechat_view(probe=query.get('probe', ['0'])[0] == '1'))
             if path == '/api/wechat/contacts':
@@ -230,8 +243,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, app.save_config(self.read_json()))
         if method == 'PUT' and path == '/api/wechat':
             return self.respond(200, app.save_wechat_config(self.read_json()))
+        if method == 'PUT' and path == '/api/efficient-mode':
+            return self.respond(200, app.live.save(self.read_json()))
         if method == 'POST':
             data = self.read_json()
+            if path == '/api/inbox/claim':
+                return self.respond(200, app.live.claim(data))
+            if path == '/api/inbox/ack':
+                return self.respond(200, app.live.ack(data))
             if path in ('/api/notify', '/api/ask'):
                 kind = 'notify' if path.endswith('notify') else 'ask'
                 record = app.create(kind, data, self.headers.get('Idempotency-Key'))

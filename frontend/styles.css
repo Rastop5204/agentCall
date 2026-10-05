@@ -1549,12 +1549,14 @@ main {
 }
 
 .status-pill.replied,
+.status-pill.read,
 .status-pill.sent {
   background: var(--accent-soft);
   color: var(--accent-text);
 }
 
-.status-pill.waiting {
+.status-pill.waiting,
+.status-pill.received {
   background: var(--warning-bg);
   color: var(--warning);
 }
@@ -2750,6 +2752,11 @@ dialog[open] {
 .routing-note { display: flex; align-items: flex-start; gap: 7px; color: var(--muted); font-size: 10px; margin: 13px 3px 21px; line-height: 1.8; }
 .routing-note svg { width: 13px; height: 13px; margin-top: 2px; }
 .wechat-panel { padding: 26px; }
+.efficient-panel { padding: 22px 26px; margin-bottom: 20px; }
+.efficient-panel .panel-heading { margin-bottom: 12px; }
+.efficient-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+.efficient-status { color: var(--muted); font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
+.efficient-panel .step-number { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
 .wechat-panel .step-number { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
 .wechat-panel .step-number svg { width: 18px; height: 18px; }
 .toggle-control { margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: 10px; white-space: nowrap; cursor: pointer; position: relative; padding-top: 4px; }
