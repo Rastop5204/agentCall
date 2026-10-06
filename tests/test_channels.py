@@ -14,6 +14,8 @@ class FakeWechat:
         self.online = True
         self.probes = 0
         self.sent = []
+        self.flags = []
+        self.notes = []
         self.account_id = 'bot-1'
         self.failure = None
 
@@ -40,11 +42,16 @@ class FakeWechat:
     def contact(self, contact_id):
         return next((c for c in self.contacts() if c['id'] == contact_id), None)
 
-    def send(self, record):
+    def send(self, record, concurrent_waiting=False):
         if self.failure:
             raise self.failure
         self.sent.append(record)
+        self.flags.append(concurrent_waiting)
         return {'message_id': 'wx-out-' + record['id']}
+
+    def send_note(self, account_id, contact_id, text):
+        self.notes.append((account_id, contact_id, text))
+        return True
 
 
 class ChannelTests(unittest.TestCase):
@@ -176,6 +183,109 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(self.store.get(first['id'])['status'], 'replied')
         self.incoming(second, message_id='wx-in-3', body='选择 B')
         self.assertEqual(self.store.get(second['id'])['reply']['body'], '选择 B')
+
+    def test_quoted_reply_attributes_to_quoted_request_and_keeps_own_words_only(self):
+        first, second = self.create(), self.create()
+        self.app.send_once()
+        self.app.send_once()
+        quoted = ('「Agent：agentCall · agentCall 连通性测试\n请回复这条消息\n\n[AC:' + first['id'] +
+                  ']」\n- - - - - - - - - - - - - - -\n就选第一个')
+        self.incoming(first, message_id='wx-in-9', body=quoted)
+        stored = self.store.get(first['id'])
+        self.assertEqual(stored['status'], 'replied')
+        self.assertEqual(stored['reply']['body'], '就选第一个')
+        self.assertEqual(self.store.get(second['id'])['status'], 'waiting')
+
+    def test_quoted_plain_reply_uses_unique_waiting_and_strips_quoted_prefix(self):
+        record = self.create()
+        self.app.send_once()
+        body = '「我：之前说过的原话」\n- - - - - - - - - - - - - - -\n继续'
+        self.incoming(record, message_id='wx-in-9', body=body)
+        stored = self.store.get(record['id'])
+        self.assertEqual(stored['status'], 'replied')
+        self.assertEqual(stored['reply']['body'], '继续')
+
+    def test_quoted_marker_conflicting_with_typed_marker_is_not_accepted(self):
+        first, second = self.create(), self.create()
+        self.app.send_once()
+        self.app.send_once()
+        body = ('「[AC:' + first['id'] + '] 原文」\n- - - - - - - - - - - - - - -\n[AC:' +
+                second['id'] + '] 回这条')
+        self.incoming(second, message_id='wx-in-9', body=body)
+        self.assertEqual(self.store.get(first['id'])['status'], 'waiting')
+        self.assertEqual(self.store.get(second['id'])['status'], 'waiting')
+
+    def test_request_ids_are_fourteen_digit_beijing_timestamps(self):
+        first, second = self.create(), self.create()
+        for record in (first, second):
+            self.assertRegex(record['id'], r'^\d{14}$')
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertIn('ac.' + first['id'], first['message_id'])
+
+    def test_send_appends_concurrency_flag_only_for_parallel_waiting_asks(self):
+        first, second = self.create(), self.create()
+        self.app.send_once()
+        self.app.send_once()
+        self.assertEqual(self.wx.flags, [False, True])
+        notify = self.app.create('notify', {'subject': '完成', 'body': 'ok'})
+        self.app.send_once()
+        self.assertEqual(self.wx.flags, [False, True, False])
+
+    def test_concurrent_waiting_asks_excludes_own_record_and_other_contacts(self):
+        first = self.create()
+        self.app.send_once()
+        self.assertFalse(self.store.concurrent_waiting_asks(first))
+        second = self.create()
+        self.assertTrue(self.store.concurrent_waiting_asks(second))
+        second['target_contact_id'] = 'someone-else'
+        self.assertFalse(self.store.concurrent_waiting_asks(second))
+
+    def test_wechat_feedback_on_reply_and_follow_up_stays_silent(self):
+        record = self.create(timeout_seconds=30)
+        self.app.send_once()
+        self.incoming(record)
+        self.assertEqual(self.wx.notes, [])  # event-thread delivery is deferred
+        self.app.deliver_wechat_feedback()
+        self.assertEqual(self.wx.notes, [('bot-1', 'user-1', 'Agent 已读')])
+        self.incoming(record, message_id='wx-in-2', body='补充说明')
+        self.app.deliver_wechat_feedback()
+        self.assertEqual(self.wx.notes, [('bot-1', 'user-1', 'Agent 已读')])
+
+    def test_wechat_feedback_on_timeout_and_late_reply(self):
+        record = self.create(timeout_seconds=30)
+        self.app.send_once()
+        self.store.expire(datetime.now(timezone.utc) + timedelta(seconds=70))
+        self.app.deliver_wechat_feedback()
+        self.assertEqual(self.wx.notes, [('bot-1', 'user-1', 'Agent 不再等待你的回复')])
+        self.incoming(record, message_id='wx-in-3')
+        self.app.deliver_wechat_feedback()
+        self.assertEqual(self.wx.notes[-1], ('bot-1', 'user-1', '回复已记录（已逾期）'))
+
+    def test_wechat_feedback_when_reply_cannot_be_attributed(self):
+        first, second = self.create(), self.create()
+        self.app.send_once()
+        self.app.send_once()
+        self.incoming(first, message_id='wx-in-1', body='同意')
+        self.app.deliver_wechat_feedback()
+        self.assertEqual(self.wx.notes, [('bot-1', 'user-1',
+            '无法确定你的回复对应哪个问题，请引用对应消息回复，或在回复中带上 [AC:编号]')])
+
+    def test_stray_message_without_waiting_ask_gets_no_feedback(self):
+        notify = self.app.create('notify', {'subject': '完成', 'body': 'ok'})
+        self.app.send_once()
+        self.incoming(notify, message_id='wx-in-1', body='在吗')
+        self.assertEqual(self.wx.notes, [])
+
+    def test_notify_and_email_replies_never_queue_feedback(self):
+        notify = self.app.create('notify', {'subject': '完成', 'body': 'ok'})
+        self.app.send_once()
+        self.incoming(notify, message_id='wx-in-1', body='[AC:' + notify['id'] + '] 收到')
+        self.assertEqual(self.wx.notes, [])
+        record = self.app.create('ask', {'subject': '邮件问题', 'body': 'A?', 'channel': 'email'})
+        self.assertTrue(self.store.add_reply(dict(request_id=record['id'], message_id='<mail-1@x>',
+                                                  from_email=record['target_email'], body='好的',
+                                                  received_at=datetime.now(timezone.utc).isoformat())))
+        self.assertEqual(self.wx.notes, [])
 
     def test_late_reply_does_not_revive_timeout(self):
         record = self.create(timeout_seconds=30)

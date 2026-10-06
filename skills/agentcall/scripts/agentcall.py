@@ -193,7 +193,7 @@ def main(argv=None):
         if args.body_file:
             body = Path(args.body_file).read_text(encoding="utf-8")
         if args.command == "test" and body is None:
-            body = "这是一条 agentCall 连通性测试。请在收到消息的渠道回复任意一句话：邮件请直接回复原邮件，微信请保留消息中的请求编号。Agent 收到后会复述你的回复，以验证发送和接收均正常。"
+            body = "这是一条 agentCall 连通性测试。请在收到消息的渠道回复任意一句话：邮件请直接回复原邮件，微信可直接回复；同时有多个问题时，请长按引用对应消息回复。Agent 收到后会复述你的回复，以验证发送和接收均正常。"
         payload = {"subject": args.subject, "body": body, "agent_name": args.agent_name}
         kind = "notify" if args.command == "notify" else "ask"
         if kind == "ask":

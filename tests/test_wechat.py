@@ -3,10 +3,11 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from gateway.wechat import WechatError, WechatGateway, _SDKClient, _connection
+from gateway.wechat import WechatError, WechatGateway, _SDKClient, _connection, _format_deadline
 
 
 class FakeClient:
@@ -48,6 +49,17 @@ class FakeClient:
 
     async def close(self):
         self.closed = True
+
+
+class DeadlineFormatTests(unittest.TestCase):
+    def test_beijing_today_tomorrow_and_beyond(self):
+        now = datetime(2026, 10, 6, 12, 0, 0, tzinfo=timezone.utc)  # Beijing 20:00
+        self.assertEqual(_format_deadline('2026-10-06T12:52:33.000+00:00', now=now), '今天 20:52:33')
+        self.assertEqual(_format_deadline('2026-10-06T16:00:00+00:00', now=now), '明天 00:00:00')
+        self.assertEqual(_format_deadline('2026-10-07T12:52:33Z', now=now), '明天 20:52:33')
+        self.assertEqual(_format_deadline('2026-10-09T06:00:00+00:00', now=now), '10月9日 14:00:00')
+        self.assertEqual(_format_deadline(None, now=now), '以记录页面为准')
+        self.assertEqual(_format_deadline('not-a-time', now=now), '以记录页面为准')
 
 
 class WechatGatewayTests(unittest.TestCase):
@@ -114,14 +126,42 @@ class WechatGatewayTests(unittest.TestCase):
         self.assertEqual(self.gateway.status()["account"]["id"], "account-1")
 
     def test_send_checks_fresh_health_and_embeds_correlation_and_deadline(self):
-        result = self.gateway.send(self.record())
+        record = self.record()
+        result = self.gateway.send(record)
         self.assertEqual(result["message_id"], "wx-message-1")
         self.assertEqual(self.client.probes, 2)
         target, text = self.client.sent[0]
         self.assertEqual(target, "friend-1")
+        self.assertIn("Codex · Request\n", text)
         self.assertIn("[AC:req123]", text)
-        self.assertIn("2026-10-05T01:02:03Z", text)
+        self.assertIn("回复截止：" + _format_deadline(record["deadline_at"]), text)
         self.assertIn("继续还是暂停？", text)
+        self.assertNotIn("请使用引用回复", text)
+
+    def test_send_appends_quote_hint_only_with_concurrent_waiting_asks(self):
+        self.gateway.send(self.record(), concurrent_waiting=True)
+        text = self.client.sent[0][1]
+        self.assertIn("当前有多条消息等待回复，请使用引用回复", text)
+        notify = self.record()
+        notify["kind"] = "notify"
+        self.gateway.send(notify, concurrent_waiting=True)
+        self.assertNotIn("回复截止", self.client.sent[1][1])
+        self.assertNotIn("请使用引用回复", self.client.sent[1][1])
+        self.assertIn("Codex · Notice", self.client.sent[1][1])
+
+    def test_send_note_probes_account_and_delivers_one_line(self):
+        self.gateway.send_note("account-1", "friend-1", "Codex 已读")
+        self.assertEqual(self.client.sent[-1], ("friend-1", "Codex 已读"))
+        with self.assertRaises(WechatError) as raised:
+            self.gateway.send_note("other-account", "friend-1", "x")
+        self.assertTrue(raised.exception.safe_to_fallback)
+
+    def test_send_note_refuses_to_block_the_wechat_event_thread(self):
+        self.gateway._thread = threading.current_thread()
+        with self.assertRaises(WechatError) as raised:
+            self.gateway.send_note("account-1", "friend-1", "x")
+        self.assertEqual(raised.exception.code, "WECHAT_FEEDBACK_THREAD")
+        self.assertEqual(self.client.sent, [])
 
     def test_no_send_to_target_bound_to_another_account(self):
         record = self.record()
@@ -310,6 +350,27 @@ class WechatInboundTests(unittest.IsolatedAsyncioTestCase):
         message.payload.timestamp = None
         await client._message(SimpleNamespace(message_id="incoming-old"))
         self.assertEqual(captured, [])
+
+    async def test_quoted_reply_line_breaks_are_normalized_before_forwarding(self):
+        client = object.__new__(_SDKClient)
+        client.puppet = SimpleNamespace(login_user_id="own-account")
+        captured = []
+        client._callback = lambda event, payload: captured.append((event, payload))
+
+        class Message:
+            payload = SimpleNamespace(timestamp=1791162000000)
+            own, room_id, message_type = False, None, 6
+            async def ready(self): pass
+            def is_self(self): return False
+            def room(self): return None
+            def type(self): return 6
+            def text(self):
+                return "「原话」<br/>- - - - - - - - - - - - - - -<br/>就选 A"
+            def talker(self): return SimpleNamespace(get_id=lambda: "friend-1")
+
+        client.bot = SimpleNamespace(Message=SimpleNamespace(load=lambda _: Message()))
+        await client._message(SimpleNamespace(message_id="incoming-1"))
+        self.assertEqual(captured[0][1]["body"], "「原话」\n- - - - - - - - - - - - - - -\n就选 A")
 
     async def test_probe_requires_dong_event_not_only_ding_rpc_success(self):
         client = object.__new__(_SDKClient)

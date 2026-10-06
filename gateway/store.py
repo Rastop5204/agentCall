@@ -16,8 +16,19 @@ def utcnow():
     return datetime.now(timezone.utc)
 
 
+# WeChat-facing times and request ids share one fixed offset: China has no
+# daylight saving, and 14-digit ids stay chronological when sorted as text.
+BEIJING = timezone(timedelta(hours=8))
+
+
 def stamp(value=None):
     return (value or utcnow()).isoformat(timespec='milliseconds')
+
+
+# WeChat delivers quoted replies as flattened text: 「…quoted original…」, a
+# divider of repeated "- ", then the user's own words. The marker scan still
+# reads the whole text; only the saved reply body drops the quoted prefix.
+_QUOTE_DIVIDER = re.compile(r'(?m)^(?:- ){9,}-[ \t]*$')
 
 
 def record_data(value):
@@ -43,6 +54,7 @@ class Store:
             raise RuntimeError('此数据目录已有 agentCall 服务正在运行。') from None
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
+        self.feedback = []
         self.db = sqlite3.connect(self.directory / 'emailcall.sqlite3', check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         (self.directory / 'emailcall.sqlite3').chmod(0o600)
@@ -132,24 +144,36 @@ class Store:
             row = self.db.execute('SELECT data,fingerprint FROM records WHERE idempotency_key=?', (key,)).fetchone()
             return (record_data(row['data']), row['fingerprint']) if row else None
 
+    def _next_request_id(self):
+        # Beijing wall clock keeps the user-facing marker short (14 digits);
+        # a same-second collision advances one second instead of growing a
+        # suffix, and the uuid fallback keeps uniqueness guaranteed regardless.
+        base = datetime.now(BEIJING).replace(microsecond=0)
+        for _ in range(20):
+            request_id = base.strftime('%Y%m%d%H%M%S')
+            if not self.db.execute('SELECT 1 FROM records WHERE id=?', (request_id,)).fetchone():
+                return request_id
+            base += timedelta(seconds=1)
+        return uuid.uuid4().hex
+
     def insert(self, kind, payload, config, key=None, fingerprint=None, error=None):
-        request_id = uuid.uuid4().hex
         now = stamp()
-        initial_status = 'failed' if error else ('received' if kind == 'incoming' else 'sent' if kind == 'diagnostic' else 'queued')
-        record = dict(id=request_id, kind=kind, subject=payload.get('subject', ''), body=payload.get('body', ''),
-                      agent_name=payload.get('agent_name', 'Agent'), target_email=config.get('target_email', ''),
-                      sender_email=config.get('email', ''), status=initial_status,
-                      created_at=now, updated_at=now, sent_at=None, deadline_at=None,
-                      timeout_seconds=payload.get('timeout_seconds', 300) if kind == 'ask' else None,
-                      message_id=f'<ac.{request_id}@agentcall.local>', error=error, reply=None, replies=[],
-                      requested_channel=payload.get('channel', 'auto'), channel=payload.get('_channel', 'email'),
-                      target_contact_id=payload.get('_target_contact_id', ''), target_contact_name=payload.get('_target_contact_name', ''),
-                      wechat_account_id=payload.get('_wechat_account_id', ''),
-                      recipient_label=payload.get('_recipient_label') or config.get('target_email', ''),
-                      fallback_reason=payload.get('_fallback_reason'), transport_message_id=None,
-                      ignored_replies=[], events=[])
-        self._event(record, record['status'], error['message'] if error else ('收到微信消息，等待 Agent 读取。' if kind == 'incoming' else '邮箱连接检查完成。' if kind == 'diagnostic' else '请求已保存，等待发送。'))
         with self.lock, self.transaction():
+            request_id = self._next_request_id()
+            initial_status = 'failed' if error else ('received' if kind == 'incoming' else 'sent' if kind == 'diagnostic' else 'queued')
+            record = dict(id=request_id, kind=kind, subject=payload.get('subject', ''), body=payload.get('body', ''),
+                          agent_name=payload.get('agent_name', 'Agent'), target_email=config.get('target_email', ''),
+                          sender_email=config.get('email', ''), status=initial_status,
+                          created_at=now, updated_at=now, sent_at=None, deadline_at=None,
+                          timeout_seconds=payload.get('timeout_seconds', 300) if kind == 'ask' else None,
+                          message_id=f'<ac.{request_id}@agentcall.local>', error=error, reply=None, replies=[],
+                          requested_channel=payload.get('channel', 'auto'), channel=payload.get('_channel', 'email'),
+                          target_contact_id=payload.get('_target_contact_id', ''), target_contact_name=payload.get('_target_contact_name', ''),
+                          wechat_account_id=payload.get('_wechat_account_id', ''),
+                          recipient_label=payload.get('_recipient_label') or config.get('target_email', ''),
+                          fallback_reason=payload.get('_fallback_reason'), transport_message_id=None,
+                          ignored_replies=[], events=[])
+            self._event(record, record['status'], error['message'] if error else ('收到微信消息，等待 Agent 读取。' if kind == 'incoming' else '邮箱连接检查完成。' if kind == 'diagnostic' else '请求已保存，等待发送。'))
             self.db.execute('INSERT INTO records VALUES (?,?,?,?,?,?,?)',
                             (request_id, kind, record['status'], now, json.dumps(record, ensure_ascii=False), key, fingerprint))
             self.changed.notify_all()
@@ -219,6 +243,8 @@ class Store:
                 if deadline + timedelta(seconds=grace) <= now:
                     record['status'] = 'timed_out'
                     self._event(record, 'timed_out', '等待时间已结束，Agent 将根据任务风险自行决定下一步；后续回复仍会保存。')
+                    if record['kind'] == 'ask' and record['channel'] == 'wechat':
+                        self._queue_feedback(record, (record.get('agent_name') or 'Agent') + ' 不再等待你的回复')
                     self._save(record)
 
     def next_poll_delay(self, interval):
@@ -227,6 +253,28 @@ class Store:
             if row[0]:
                 return min(interval, max(1, (datetime.fromisoformat(row[0]) - utcnow()).total_seconds() + 1))
             return interval
+
+    def _queue_feedback(self, record, text):
+        # One-line WeChat status notes; the service layer drains and sends them
+        # best effort. "已读" fires on reply arrival, not on an actual agent read.
+        self.feedback.append(dict(account_id=record.get('wechat_account_id') or '',
+                                  contact_id=record.get('target_contact_id') or '', text=text))
+
+    def drain_feedback(self):
+        with self.lock:
+            notes, self.feedback = self.feedback, []
+            return notes
+
+    def concurrent_waiting_asks(self, record):
+        """Whether another live ask from the same account targets this contact."""
+        with self.lock:
+            row = self.db.execute("""SELECT 1 FROM records WHERE kind='ask' AND id<>?
+                AND status IN ('waiting','sending') AND json_extract(data,'$.channel')='wechat'
+                AND json_extract(data,'$.wechat_account_id')=?
+                AND json_extract(data,'$.target_contact_id')=? LIMIT 1""",
+                (record['id'], record.get('wechat_account_id') or '',
+                 record.get('target_contact_id') or '')).fetchone()
+            return bool(row)
 
     def add_reply(self, item):
         with self.lock, self.transaction():
@@ -254,6 +302,10 @@ class Store:
                 record['reply'] = reply
             if record['kind'] == 'ask' and record['status'] == 'waiting' and not late:
                 record['status'], record['reply'] = 'replied', reply
+                if record['channel'] == 'wechat':
+                    self._queue_feedback(record, (record.get('agent_name') or 'Agent') + ' 已读')
+            elif record['kind'] == 'ask' and record['channel'] == 'wechat' and record['status'] == 'timed_out':
+                self._queue_feedback(record, '回复已记录（已逾期）')
             if reply.get('unconfirmed'):
                 self._event(record, 'reply_unconfirmed', '收到明确关联的回复并归档；原发送结果未知，请求状态未自动改变。')
             else:
@@ -357,9 +409,23 @@ class Store:
                     item['ignored_reason'] = dict(code='WECHAT_SENDER_MISMATCH', message='微信回复并非来自此请求的目标联系人。', hint='只有所选联系人可以回复此请求。')
                     saved = self.add_ignored_reply(item)
                 else:
-                    item['body'] = re.sub(r'\[(?:AC|EC):' + re.escape(record['id']) + r'\]', '', item['body']).strip()
+                    body = item['body']
+                    divider = _QUOTE_DIVIDER.search(body)
+                    if divider and body[divider.end():].strip():
+                        body = body[divider.end():]
+                    item['body'] = re.sub(r'\[(?:AC|EC):' + re.escape(record['id']) + r'\]', '', body).strip()
                     saved = bool(item['body']) and self.add_reply(item)
             elif related and not capture_unmatched:
+                # Nudge only when a live question plausibly expected this text;
+                # stray chatter with nothing waiting stays a silent diagnostic.
+                expects_answer = len(matches) > 1 or conflicting or self.db.execute(
+                    """SELECT 1 FROM records WHERE kind='ask' AND status IN ('waiting','sending')
+                       AND json_extract(data,'$.channel')='wechat'
+                       AND json_extract(data,'$.target_contact_id')=? AND json_extract(data,'$.wechat_account_id')=?
+                       LIMIT 1""", (item['from_contact_id'], item['account_id'])).fetchone()
+                if expects_answer:
+                    self.feedback.append(dict(account_id=item['account_id'], contact_id=item['from_contact_id'],
+                        text='无法确定你的回复对应哪个问题，请引用对应消息回复，或在回复中带上 [AC:编号]'))
                 self.diagnostic([{'name': '微信回复匹配', 'ok': False, 'error': dict(code='WECHAT_REPLY_AMBIGUOUS' if len(matches) > 1 or conflicting else 'WECHAT_REPLY_UNMATCHED',
                     message='收到目标联系人的微信消息，但无法安全确定回复归属，已保存且未作为决策。',
                     hint='请在回复中保留对应问题的 [AC:请求编号]。回复内容：' + item['body'])}], channel='wechat')

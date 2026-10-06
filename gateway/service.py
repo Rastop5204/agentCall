@@ -100,7 +100,20 @@ class Gateway:
             raise APIError(error['code'], error['message'], error['hint'], 503) from None
 
     def receive_wechat(self, item):
+        # Inbound events arrive on the WeChat event-loop thread; sending a
+        # status note from here would block that loop on itself for the whole
+        # operation timeout, so feedback is left for the deadlines thread,
+        # which drains the queue twice a second.
         return self.live.receive(item)
+
+    def deliver_wechat_feedback(self):
+        """Send queued one-line status notes; failures only leave a diagnostic."""
+        for note in self.store.drain_feedback():
+            try:
+                self.channels.wechat.send_note(note['account_id'], note['contact_id'], note['text'])
+            except Exception:
+                self.store.diagnostic([{'name': '微信状态通知', 'ok': False, 'error': dict(
+                    code='WECHAT_FEEDBACK_FAILED', message='状态通知未能发出。', hint='不影响请求与回复本身。')}], channel='wechat')
 
     def save_config(self, data):
         fields = set(DEFAULT_CONFIG) | {'password', 'password_set'}
@@ -223,7 +236,8 @@ class Gateway:
             record = self.store.set_route(record['id'], channel, selection['fallback_reason'])
             if channel == 'wechat':
                 try:
-                    result = self.channels.wechat.send(record)
+                    result = self.channels.wechat.send(record, concurrent_waiting=(
+                        record['kind'] == 'ask' and self.store.concurrent_waiting_asks(record)))
                 except Exception as exc:
                     from gateway.channels import safe_error
                     error = safe_error(exc)
@@ -280,6 +294,7 @@ class Gateway:
             if mailbox_checked:
                 self.store.expire(started_at, mailbox_checked=True)
             self.store.expire()
+            self.deliver_wechat_feedback()
 
     def start(self):
         self.channels.start()
@@ -307,6 +322,7 @@ class Gateway:
             while not self.stop_event.wait(.5):
                 try:
                     self.store.expire()
+                    self.deliver_wechat_feedback()
                 except Exception:
                     logging.error('等待期限更新失败。')
 

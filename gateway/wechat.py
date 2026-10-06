@@ -19,9 +19,11 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from gateway.store import BEIJING
 
 PROBE_TIMEOUT = 3
 OPERATION_TIMEOUT = 20
@@ -32,6 +34,23 @@ MAX_TEXT = 32000
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _format_deadline(value, *, now=None):
+    """Render a UTC deadline as Beijing time with 今天/明天 day labels."""
+    try:
+        deadline = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except ValueError:
+        return '以记录页面为准'
+    if deadline.tzinfo is None:
+        return '以记录页面为准'
+    moment = deadline.astimezone(BEIJING)
+    days = (moment.date() - (now or datetime.now(timezone.utc)).astimezone(BEIJING).date()).days
+    if days == 0:
+        return moment.strftime('今天 %H:%M:%S')
+    if days == 1:
+        return moment.strftime('明天 %H:%M:%S')
+    return f'{moment.month}月{moment.day}日 {moment:%H:%M:%S}'
 
 
 class WechatError(Exception):
@@ -303,7 +322,9 @@ class _SDKClient:
             # to its own MESSAGE_TYPE_TEXT = 6 (7 there means video).
             if int(message.type()) != 6:
                 return
-            body = message.text()
+            # Quoted replies arrive as flattened text with literal <br/> breaks;
+            # one reply, one line feed, keeps every downstream consumer plain.
+            body = re.sub(r'<br\s*/?>', '\n', message.text())
             if not body or len(body) > MAX_TEXT:
                 return
             talker_id = message.talker().get_id()
@@ -609,7 +630,7 @@ class WechatGateway:
         except Exception as exc:
             raise _error(exc) from None
 
-    async def _send(self, record, account_id):
+    async def _send(self, record, account_id, concurrent_waiting=False):
         client = self._client
         if client is None:
             raise WechatError("WECHAT_UNAVAILABLE", "微信连接已断开。", "将尝试可用的邮箱。", True)
@@ -628,19 +649,20 @@ class WechatGateway:
         if self._client is not client or account.get("id") != account_id:
             raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信连接或登录账号发生变化。",
                               "请确认登录状态后重试。", True)
-        text = "agentCall · " + (record.get("agent_name") or "Agent") + "\n" + record["subject"] + "\n\n" + record["body"].rstrip()
+        label = "Request" if record["kind"] == "ask" else "Notice"
+        text = (record.get("agent_name") or "Agent") + " · " + label + "\n" + record["subject"] + "\n\n" + record["body"].rstrip()
         text += "\n\n[AC:" + record["id"] + "]"
         if record["kind"] == "ask":
-            text += ("\n请直接回复；同时存在多个问题时，请在回复中保留上面的 [AC:…] 标识。"
-                     "\n回复截止：" + str(record.get("deadline_at") or "以记录页面为准") +
-                     "。逾期回复仍会记录，但不会作为本次等待的及时决策。")
+            text += "\n回复截止：" + _format_deadline(record.get("deadline_at"))
+            if concurrent_waiting:
+                text += "\n当前有多条消息等待回复，请使用引用回复"
         try:
             message_id = await asyncio.wait_for(client.send(target, text), 10)
         except Exception as exc:
             raise _error(exc, sending=True) from None
         return {"message_id": message_id or None}
 
-    def send(self, record):
+    def send(self, record, concurrent_waiting=False):
         status = self._require_login()
         account_id = record.get("wechat_account_id") or record.get("account_id")
         if not account_id or account_id != status["account"]["id"]:
@@ -648,11 +670,33 @@ class WechatGateway:
         if not record.get("target_contact_id"):
             raise WechatError("WECHAT_CONTACT_NOT_FOUND", "尚未选择微信目标联系人。", "请在配置中选择已有联系人。", True)
         try:
-            return self._call(self._send(record, account_id), OPERATION_TIMEOUT)
+            return self._call(self._send(record, account_id, concurrent_waiting), OPERATION_TIMEOUT)
         except (TimeoutError, concurrent.futures.TimeoutError, concurrent.futures.CancelledError) as exc:
             # A deadline or shutdown cancellation can race with send acceptance.
             # Do not classify cancellation as a safe preflight connection failure.
             raise _error(exc, sending=True) from None
+        except Exception as exc:
+            raise _error(exc) from None
+
+    def send_note(self, account_id, contact_id, text):
+        """Best-effort one-line status note; never creates or mutates records."""
+        if threading.current_thread() is self._thread:
+            # _call would wait on the very loop this thread is running; a note
+            # must only ever be delivered from a service thread.
+            raise WechatError("WECHAT_FEEDBACK_THREAD", "状态通知不能在微信事件线程内发送。", "由服务线程投递。", True)
+        status = self._require_login()
+        client = self._client
+        if client is None or not contact_id or account_id != status["account"]["id"]:
+            raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信连接或账号与请求绑定的不一致。", "状态通知未发送。", True)
+
+        async def deliver():
+            current = await client.probe()
+            if not current or current["id"] != account_id:
+                raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信登录账号发生变化。", "状态通知未发送。", True)
+            return await client.send(contact_id, text[:MAX_TEXT])
+
+        try:
+            return self._call(deliver(), OPERATION_TIMEOUT)
         except Exception as exc:
             raise _error(exc) from None
 

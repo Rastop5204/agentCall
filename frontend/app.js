@@ -898,7 +898,7 @@ $("#send-test").addEventListener("click", async () => {
           config: testFingerprint(state.config, state.wechat, testChannel()),
           body: {
             subject: "agentCall 连通性测试 · 请回复这条消息",
-            body: "你好！这是来自 agentCall 的对话测试。\n\n请在 5 分钟内回复，可以写下「已收到，连接成功」，或任何你想说的话。收到回复后，agentCall 会在网页中显示回复原文。\n\n使用微信时，请按消息末尾的说明回复；使用邮箱时，请直接回复原邮件。安装 Skill 后，你也可以让 Agent 发起测试并复述你的回复。",
+            body: "你好！这是来自 agentCall 的对话测试。\n\n请在 5 分钟内回复，可以写下「已收到，连接成功」，或任何你想说的话。收到回复后，agentCall 会在网页中显示回复原文。\n\n使用微信时直接回复即可，同时有多个问题时请长按引用对应消息；使用邮箱时，请直接回复原邮件。安装 Skill 后，你也可以让 Agent 发起测试并复述你的回复。",
             agent_name: "agentCall 连通性测试",
             timeout_seconds: 300,
             channel: testChannel(),
