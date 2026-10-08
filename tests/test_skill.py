@@ -176,6 +176,89 @@ class SkillClientTests(unittest.TestCase):
         self.assertEqual(opener.call_count, 2)
         self.assertEqual({call.args[0].get_header("Idempotency-key") for call in opener.call_args_list}, {"stable-key"})
 
+    def _hook_items(self):
+        return {'mode': {'enabled': True}, 'items': [
+            {'id': 7, 'kind': 'message', 'body': '新要求'},
+            {'id': 9, 'kind': 'reply', 'request_id': 'req-2', 'late': True, 'body': '晚到回复'}]}
+
+    def test_inbox_hook_surfaces_new_messages_without_claiming_lease(self):
+        client = mock.Mock()
+        client.request.return_value = self._hook_items()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.cli, 'HOOK_STATE_DIR', Path(directory)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.cli.inbox_hook(client, json.dumps(
+                {'session_id': 'sess-1', 'hook_event_name': 'PostToolUse'})), 0)
+        client.request.assert_called_once_with('GET', '/api/inbox?limit=50', timeout=5, attempts=1)
+        payload = json.loads(output.getvalue())
+        context = payload['hookSpecificOutput']['additionalContext']
+        self.assertEqual(payload['hookSpecificOutput']['hookEventName'], 'PostToolUse')
+        self.assertIn('#7', context)
+        self.assertIn('#9', context)
+        self.assertIn('req-2', context)
+        self.assertIn('untrusted_user_data', context)
+        self.assertIn('ack', context)
+
+    def test_inbox_hook_codex_payload_uses_top_level_context(self):
+        client = mock.Mock()
+        client.request.return_value = self._hook_items()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.cli, 'HOOK_STATE_DIR', Path(directory)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.cli.inbox_hook(client, json.dumps({'session_id': 'codex-1'})), 0)
+        payload = json.loads(output.getvalue())
+        self.assertIn('additionalContext', payload)
+        self.assertNotIn('hookSpecificOutput', payload)
+
+    def test_inbox_hook_debounces_and_never_repeats_a_seq(self):
+        client = mock.Mock()
+        client.request.return_value = self._hook_items()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.cli, 'HOOK_STATE_DIR', Path(directory)):
+            state = Path(directory) / 'sess-1.json'
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.cli.inbox_hook(client, json.dumps({'session_id': 'sess-1'}))
+            self.assertEqual(len(output.getvalue().splitlines()), 1)
+            # 10 秒防抖：第二次调用不发起网络请求
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.cli.inbox_hook(client, json.dumps({'session_id': 'sess-1'}))
+            self.assertEqual(output.getvalue(), '')
+            self.assertEqual(client.request.call_count, 1)
+            # 越过防抖后，已浮出的编号不再重复注入，新编号会注入
+            state.write_text(json.dumps({'checked_at': 0, 'max_seq': 9}), encoding='utf-8')
+            client.request.return_value = {'mode': {'enabled': True}, 'items': self._hook_items()['items'] + [
+                {'id': 11, 'kind': 'message', 'body': '补充'}]}
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.cli.inbox_hook(client, json.dumps({'session_id': 'sess-1'}))
+            context = output.getvalue()
+            self.assertNotIn('#7', context)
+            self.assertIn('#11', context)
+
+    def test_inbox_hook_silent_when_mode_disabled_without_losing_history(self):
+        client = mock.Mock()
+        client.request.return_value = {'mode': {'enabled': False}, 'items': self._hook_items()['items']}
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(self.cli, 'HOOK_STATE_DIR', Path(directory)), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.cli.inbox_hook(client, json.dumps({'session_id': 'sess-1'})), 0)
+                self.assertEqual(output.getvalue(), '')
+            state = json.loads((Path(directory) / 'sess-1.json').read_text(encoding='utf-8'))
+            self.assertNotIn('max_seq', state)  # 重新开启高效模式后仍会浮出历史消息
+
+    def test_inbox_hook_entry_never_fails_loudly(self):
+        with mock.patch.object(self.cli, 'load_config', side_effect=self.cli.ClientError('坏配置')), \
+                mock.patch('sys.stdin', io.StringIO('{}')), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.cli.main(['inbox-hook']), 0)
+        self.assertEqual(output.getvalue(), '')
+        client = mock.Mock()
+        client.request.side_effect = self.cli.ClientError('服务不可达')
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(self.cli, 'HOOK_STATE_DIR', Path(directory)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.cli.inbox_hook(client, 'not json at all'), 0)
+        self.assertEqual(output.getvalue(), '')
+
 
 class InstallerTests(unittest.TestCase):
     @classmethod
@@ -242,6 +325,61 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.installer.install("codex", user_home=user_home, source=ROOT / "skills/agentcall")
             self.assertFalse((user_home / ".codex").exists())
+
+    def test_install_writes_managed_hook_and_preserves_user_hooks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory) / "home"
+            source = Path(directory) / "source"
+            source.mkdir()
+            (source / "SKILL.md").write_text("skill")
+            (source / "config.json").write_text('{"base_url":"http://127.0.0.1:10086","token":"secret"}')
+            settings = user_home / ".claude/settings.json"
+            settings.parent.mkdir(parents=True)
+            user_hook = {"hooks": [{"type": "command", "command": "echo user-hook"}]}
+            settings.write_text(json.dumps({"hooks": {"PostToolUse": [user_hook]}, "other": True}))
+            self.installer.install("claude", user_home=user_home, source=source)
+            self.installer.install("claude", user_home=user_home, source=source)
+            data = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertTrue(data["other"])
+            entries = data["hooks"]["PostToolUse"]
+            managed = [e for e in entries if e is not user_hook
+                       and "agentcall.py inbox-hook" in str(e["hooks"][0]["command"])]
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(len(managed), 1)
+            command = managed[0]["hooks"][0]["command"]
+            self.assertIn(str(user_home / ".claude/skills/agentcall/scripts/agentcall.py"), command)
+            self.assertEqual(managed[0]["hooks"][0]["timeout"], 20)
+            self.installer.uninstall("claude", user_home=user_home)
+            data = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(data["hooks"]["PostToolUse"], [user_hook])
+            self.assertTrue(data["other"])
+
+    def test_codex_hooks_json_created_and_cleaned_on_uninstall(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory) / "home"
+            source = Path(directory) / "source"
+            source.mkdir()
+            (source / "SKILL.md").write_text("skill")
+            (source / "config.json").write_text('{"base_url":"http://127.0.0.1:10086","token":"secret"}')
+            self.installer.install("codex", user_home=user_home, source=source)
+            hooks = user_home / ".codex/hooks.json"
+            self.assertIn("agentcall.py inbox-hook", hooks.read_text(encoding="utf-8"))
+            self.installer.uninstall("codex", user_home=user_home)
+            data = json.loads(hooks.read_text(encoding="utf-8"))
+            self.assertNotIn("PostToolUse", data.get("hooks", {}))
+
+    def test_unparseable_hook_config_is_left_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_home = Path(directory) / "home"
+            source = Path(directory) / "source"
+            source.mkdir()
+            (source / "SKILL.md").write_text("skill")
+            (source / "config.json").write_text('{"base_url":"http://127.0.0.1:10086","token":"secret"}')
+            settings = user_home / ".claude/settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text("not json {")
+            self.installer.install("claude", user_home=user_home, source=source)
+            self.assertEqual(settings.read_text(encoding="utf-8"), "not json {")
 
     def test_http_export_can_be_installed_into_isolated_home(self):
         from gateway.server import make_server
@@ -345,18 +483,6 @@ class DeploymentMigrationTests(unittest.TestCase):
                 migration.migrate()
             self.assertEqual(docker.call_count, 1)
 
-    def test_wechat_token_is_private_stable_and_separate_from_database(self):
-        entrypoint = load_module('agentcall_entrypoint', ROOT / 'docker/entrypoint.py')
-        with tempfile.TemporaryDirectory() as directory:
-            database = Path(directory) / 'emailcall.sqlite3'
-            database.write_bytes(b'original-database')
-            token_file = entrypoint.ensure_wechat_token(directory)
-            original = token_file.read_text()
-            entrypoint.ensure_wechat_token(directory)
-            self.assertEqual(token_file.read_text(), original)
-            self.assertEqual(token_file.parent.name, 'wechat-bridge')
-            self.assertEqual(token_file.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(database.read_bytes(), b'original-database')
 
 
 if __name__ == "__main__":

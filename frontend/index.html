@@ -39,14 +39,28 @@
           <span>一条消息，连接每个决策。</span>
         </div>
         <div class="sidebar-bottom">
-          <div class="local-status">
-            <span id="service-dot" class="status-dot"></span>
-            <div>
-              <strong id="service-label">正在连接本地服务</strong
-              ><span id="service-caption">127.0.0.1 : 10086</span>
+          <details class="local-service">
+            <summary>
+              <span id="service-dot" class="status-dot"></span>
+              <div>
+                <strong id="service-label">正在连接本地服务</strong
+                ><span id="service-caption">127.0.0.1 : 10086</span>
+              </div>
+              <span class="disclosure-chevron" data-icon="chevron-down"></span>
+            </summary>
+            <div class="local-service-content">
+              <strong>本机 API 与访问密钥</strong>
+              <code>http://127.0.0.1:10086</code>
+              <p>Skill 已包含访问密钥，通常无需手动配置。</p>
+              <div class="token-actions">
+                <button class="text-button" id="copy-token" type="button">
+                  <span data-icon="copy"></span>复制密钥</button
+                ><button class="text-button" id="rotate-token" type="button">
+                  <span data-icon="refresh"></span>更换密钥
+                </button>
+              </div>
             </div>
-            <span data-icon="lock"></span>
-          </div>
+          </details>
           <button class="theme-toggle" id="theme-toggle" type="button">
             <span id="theme-icon" data-icon="moon"></span
             ><span id="theme-label">切换深色外观</span
@@ -74,9 +88,9 @@
                 <span class="eyebrow-line"></span> YOUR AGENT, ALWAYS IN REACH
               </div>
               <h1 id="config-title">
-                让每一次协作，都有回音<span class="title-dot">.</span>
+                更像同事间的协作<span class="title-dot">.</span>
               </h1>
-              <p>微信优先，邮箱接力。让 Agent 在完成任务与需要决策时找到你。</p>
+              <p>微信优先，邮箱兜底。随时随地与 Agent 沟通。</p>
             </div>
             <span class="local-badge"
               ><span data-icon="shield"></span>仅在本机运行</span
@@ -89,32 +103,24 @@
                 <button type="button" id="email-tab" class="channel-tab" role="tab" aria-selected="false" aria-controls="config-form" tabindex="-1" data-channel-tab="email"><span data-icon="mail"></span><span>邮箱<small>自动备用</small></span><span id="email-tab-status" class="channel-tab-status">未配置</span></button>
               </div>
               <p class="routing-note"><span data-icon="repeat"></span>每次发送前检查微信登录状态；微信不可用时，自动使用已保存的邮箱。</p>
-              <section class="panel efficient-panel" aria-labelledby="efficient-title">
-                <div class="panel-heading"><span class="step-number"><span data-icon="activity"></span></span><div><h2 id="efficient-title">高效模式</h2><p>把微信作为当前 Agent 会话的沟通入口。</p></div><label class="toggle-control"><input id="efficient-enabled" type="checkbox"/><span class="toggle-track" aria-hidden="true"></span><span>启用</span></label></div>
-                <p class="field-help">开启后，Agent 的进度、问题与结果都通过微信发送。指定联系人的私聊文字随时保存，Agent 在步骤边界收取，空闲时可等待新消息；运行长工具或结束会话后不会自动唤醒。</p>
-                <div class="efficient-footer"><div id="efficient-status" class="efficient-status" role="status" aria-live="polite">正在获取状态…</div><button id="save-efficient-mode" class="button secondary" type="button"><span data-icon="check"></span>保存模式</button></div>
-              </section>
               <form id="wechat-config-panel" class="wechat-form" role="tabpanel" aria-labelledby="wechat-tab">
+                <section class="panel efficient-panel" aria-labelledby="efficient-title">
+                  <div class="panel-heading"><span class="step-number"><span data-icon="activity"></span></span><div><h2 id="efficient-title">高效模式</h2><p>把微信作为当前 Agent 会话的沟通入口。</p></div><label class="toggle-control"><input id="efficient-enabled" type="checkbox"/><span class="toggle-track" aria-hidden="true"></span><span>启用</span></label></div>
+                  <p class="field-help">开启后，Agent 的进度、问题与结果都通过微信发送。文件传输助手里的私聊文字随时保存，Agent 在步骤边界收取，空闲时可等待新消息；运行长工具或结束会话后不会自动唤醒。</p>
+                  <div class="efficient-footer"><div id="efficient-status" class="efficient-status" role="status" aria-live="polite">正在获取状态…</div><button id="save-efficient-mode" class="button secondary" type="button"><span data-icon="check"></span>保存模式</button></div>
+                </section>
                 <section class="panel wechat-panel" aria-labelledby="wechat-title">
                   <div class="panel-heading">
                     <span class="step-number"><span data-icon="wechat"></span></span>
-                    <div><h2 id="wechat-title">用微信保持联系</h2><p>扫码连接你的微信，为 Agent 指定一位联系人。</p></div>
+                    <div><h2 id="wechat-title">用微信保持联系</h2><p>扫码连接你的微信，通过文件传输助手与 Agent 对话。</p></div>
                     <label class="toggle-control"><input type="checkbox" id="wechat-enabled" name="wechat_enabled"/><span class="toggle-track" aria-hidden="true"></span><span>启用微信</span></label>
                   </div>
-                  <div id="wechat-status" class="wechat-status" role="status" aria-live="polite"><span class="status-dot"></span><div><strong id="wechat-status-title">尚未连接微信</strong><p id="wechat-status-description">保存设置后，扫码登录。</p></div></div>
+                  <ol id="wechat-steps" class="wechat-steps" aria-label="微信登录进度" hidden><li data-step="0"><span class="step-index">1</span><span class="step-label">连接微信服务</span></li><li data-step="1"><span class="step-index">2</span><span class="step-label">待扫码</span></li><li data-step="2"><span class="step-index">3</span><span class="step-label">待确认</span></li><li data-step="3"><span class="step-index">4</span><span class="step-label">登录</span></li></ol>
                   <div id="wechat-error" class="error-box wechat-error" hidden></div>
                   <div class="wechat-login-layout">
                     <div id="wechat-qr" class="wechat-qr" aria-label="微信登录二维码"><div class="qr-placeholder"><span data-icon="qr"></span><span>登录二维码会显示在这里</span></div></div>
-                    <div class="wechat-login-help"><h3 id="wechat-login-title">从一次扫码开始</h3><p id="wechat-login-help">点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新选择目标联系人。</p><button class="button primary" type="button" id="wechat-login"><span data-icon="qr"></span>扫码登录</button><div class="wechat-session-actions"><button class="text-button" type="button" id="wechat-refresh"><span data-icon="refresh"></span>刷新状态</button><button class="text-button" type="button" id="wechat-logout" hidden><span data-icon="logout"></span>断开并停用微信</button></div></div>
+                    <div class="wechat-login-help"><h3 id="wechat-login-title">从一次扫码开始</h3><p id="wechat-login-help">点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新扫码登录。</p><button class="button primary" type="button" id="wechat-login"><span data-icon="qr"></span>扫码登录</button><div class="wechat-session-actions"><button class="text-button" type="button" id="wechat-refresh"><span data-icon="refresh"></span>刷新状态</button><button class="text-button" type="button" id="wechat-logout" hidden><span data-icon="logout"></span>断开并停用微信</button></div></div>
                   </div>
-                  <details class="advanced-settings" id="wechat-advanced"><summary><span data-icon="sliders"></span>微信连接设置<span class="summary-info">Wechaty 服务</span><span class="disclosure-chevron" data-icon="chevron-down"></span></summary><div class="advanced-content"><p class="field-help wechat-service-help">本机模式随 Docker 一起运行，无需服务令牌。也可连接你已有的 Wechaty 服务。</p><div class="field"><label for="wechat-mode">连接方式</label><select id="wechat-mode"><option value="local">本机服务 · 推荐</option><option value="external">外部 Wechaty 服务</option></select></div><div id="wechat-external-settings" hidden><div class="field"><label for="wechat-endpoint">服务地址</label><input id="wechat-endpoint" name="wechat_endpoint" placeholder="your-wechaty-service:8788" spellcheck="false" autocomplete="off"/></div><div class="field"><label for="wechat-token">服务令牌 <span id="wechat-token-state" class="optional"></span></label><input type="password" id="wechat-token" name="wechat_token" placeholder="输入外部服务的访问令牌" autocomplete="new-password"/><p class="field-help">令牌只保存在本机，已保存的内容不会回显。</p></div></div></div></details>
-                </section>
-                <section class="panel target-panel wechat-target-panel" aria-labelledby="wechat-target-title"><div class="panel-heading"><span class="step-number">02</span><div><h2 id="wechat-target-title">消息发给谁</h2><p>选择一位已有微信联系人，通知与回复都与此人关联。</p></div><span class="heading-icon" data-icon="user"></span></div>
-                  <div id="wechat-selected-contact" class="selected-contact" hidden></div>
-                  <div class="contact-toolbar"><div class="search-field"><span data-icon="search"></span><input id="wechat-contact-search" type="search" placeholder="搜索联系人姓名或备注" aria-label="搜索微信联系人" autocomplete="off"/></div><button type="button" class="button secondary" id="wechat-load-contacts" disabled><span data-icon="refresh"></span>获取联系人</button></div>
-                  <div id="wechat-contacts" class="contact-list" role="group" aria-label="选择目标联系人"><p class="contact-empty">登录微信后，获取并选择联系人。</p></div>
-                  <p class="field-help">这里选择的是已有联系人；请先在微信中添加需要联系的人。</p>
-                  <div class="info-line"><span data-icon="shield"></span><span>仅接受所选联系人的私聊回复。群聊、其他人的消息不会作为你的决定。</span></div>
                 </section>
                 <div class="form-footer"><span id="wechat-save-status"><span data-icon="lock"></span>配置与登录会话持久保存</span><button class="button primary" id="save-wechat" type="submit"><span data-icon="check"></span>保存微信配置</button></div>
               </form>
@@ -127,9 +133,9 @@
                   <span class="step-number">01</span>
                   <div>
                     <h2 id="account-title">备用发送邮箱</h2>
-                    <p>微信不可用时，通过这个邮箱发送消息与接收回复。</p>
+                    <p>微信不可用时，通过这个邮箱发送消息与接收回复；关闭后保留凭据、暂停备用与收件。</p>
                   </div>
-                  <span class="heading-icon" data-icon="mail"></span>
+                  <label class="toggle-control"><input type="checkbox" id="email-enabled" name="email_enabled" checked/><span class="toggle-track" aria-hidden="true"></span><span>启用邮箱</span></label>
                 </div>
                 <fieldset class="provider-fieldset">
                   <legend>邮箱服务</legend>
@@ -402,10 +408,42 @@
             </form>
             </div>
             <aside class="setup-aside" aria-label="连接与测试">
+              <section class="skill-panel" aria-labelledby="skill-title">
+                <div class="skill-top">
+                  <span class="skill-icon" data-icon="terminal"></span
+                  ><span class="skill-tag">AGENT SKILL</span>
+                </div>
+                <h2 id="skill-title">让 Agent 学会联系你</h2>
+                <p>
+                  兼容 Codex、Claude Code 等支持 Skill 的
+                  Agent，附带安装脚本与调用工具。
+                </p>
+                <button
+                  class="button skill-download"
+                  id="export-skill"
+                  type="button"
+                >
+                  <span data-icon="download"></span>导出 Agent Skill<span
+                    data-icon="arrow-up-right"
+                  ></span>
+                </button>
+                <div class="skill-footnote">
+                  <span data-icon="lock"></span>包含本机访问密钥，请妥善保存
+                </div>
+              </section>
               <section class="panel journey-panel">
                 <div class="compact-heading">
                   <h2>连接只需三步</h2>
-                  <span class="small-label" id="setup-progress">0 / 3</span>
+                  <div class="compact-heading-side">
+                    <span class="small-label" id="setup-progress">0 / 3</span>
+                    <button
+                      class="icon-button journey-close"
+                      id="dismiss-journey"
+                      type="button"
+                      aria-label="关闭连接引导"
+                      data-icon="x"
+                    ></button>
+                  </div>
                 </div>
                 <ol class="setup-steps">
                   <li id="step-mail">
@@ -433,29 +471,6 @@
                 <div class="journey-bottom">
                   <span data-icon="repeat"></span>完成任务时通知 ·
                   需要决策时询问
-                </div>
-              </section>
-              <section class="skill-panel" aria-labelledby="skill-title">
-                <div class="skill-top">
-                  <span class="skill-icon" data-icon="terminal"></span
-                  ><span class="skill-tag">AGENT SKILL</span>
-                </div>
-                <h2 id="skill-title">让 Agent 学会联系你</h2>
-                <p>
-                  兼容 Codex、Claude Code 等支持 Skill 的
-                  Agent，附带安装脚本与调用工具。
-                </p>
-                <button
-                  class="button skill-download"
-                  id="export-skill"
-                  type="button"
-                >
-                  <span data-icon="download"></span>导出 Agent Skill<span
-                    data-icon="arrow-up-right"
-                  ></span>
-                </button>
-                <div class="skill-footnote">
-                  <span data-icon="lock"></span>包含本机访问密钥，请妥善保存
                 </div>
               </section>
               <section class="panel test-panel" aria-labelledby="test-title">
@@ -493,28 +508,6 @@
                   hidden
                 ></div>
               </section>
-              <details class="api-panel">
-                <summary>
-                  <span data-icon="code"></span>本机 API 与访问密钥<span
-                    data-icon="chevron-down"
-                  ></span>
-                </summary>
-                <div class="api-content">
-                  <code>http://127.0.0.1:10086</code>
-                  <p>Skill 已包含访问密钥，通常无需手动配置。</p>
-                  <div class="token-actions">
-                    <button class="text-button" id="copy-token" type="button">
-                      <span data-icon="copy"></span>复制密钥</button
-                    ><button
-                      class="text-button"
-                      id="rotate-token"
-                      type="button"
-                    >
-                      <span data-icon="refresh"></span>更换密钥
-                    </button>
-                  </div>
-                </div>
-              </details>
             </aside>
           </div>
           <footer class="page-footer">
@@ -538,7 +531,7 @@
               <h1 id="records-title">
                 每一次联系，都有迹可循<span class="title-dot">.</span>
               </h1>
-              <p>从任务通知到你的回复，让协作的来龙去脉清晰可见。</p>
+              <p>让协作清晰可见。</p>
             </div>
             <button class="button secondary" id="refresh-records" type="button">
               <span data-icon="refresh"></span>刷新记录

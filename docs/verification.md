@@ -105,3 +105,18 @@ Node／前端 6 组测试通过；Docker Python 3.10 内 24 项真实 SDK／传�
 运行中的网关与导出 skill 已更新，Codex 安装器从真实导出包安装，验证 API 令牌与原配置一致，受管理全局规则已更新。高效模式已开启，WeChat 实测在线。实际收到目标联系人不带编号的「高效模式测试」，事件 id=1、kind=message，记录 67959607c55e48d1b5ac87abccb9c3a8。已通过微信复述；网关容器重建后仍返回同一待确认消息，确认后记录变为 read、队列为空，证明真实主动收件、重启保留和确认流程可用。未重新扫码或重启 Chromium。浏览器实际配置页显示启用及在线状态，记录页显示「微信收件／Agent 已读取」与原文。
 
 本模式转发用户可见消息，在步骤边界收取，用户要求继续等待时使用空闲长轮询。仅支持目标联系人的私聊文字；不能自动唤醒已结束的会话，也不能在长工具执行期间立即注入消息。微信不可用时发送仍回退邮箱，输入等待微信恢复；没有建立独立后台 Agent。
+
+
+## 微信传输层重构：Wechaty → 内嵌文件传输助手协议（2.2.0，2026-10-08）
+
+移除 Wechaty 双容器栈（Python SDK + Node/Chromium sidecar + gRPC + 令牌卷），vendor [wx-filehelper-api](https://github.com/CjackHwang/wx-filehelper-api) 的协议核心 `direct_bot.py`（commit `cb52d3a`）到 `gateway/wxbot/`，网关进程内直接驱动文件传输助手网页协议。联系人模块整体移除：对话目标恒为 `filehelper`，登录事件自动绑定账号；`store.py`／`live.py`／`service.py` 零改动，DB schema 不变（遗留配置与旧联系人绑定在读取时惰性清洗）。引用回复通过 vendored 补丁把 refermsg appmsg 归一为既有「引用原文 + `- ` 分割线」文本形态，store 侧归属逻辑原样保留；`send_text` 顺带透出服务器 MsgID，激活 `transport_message_id` 关联路径。vendored 补丁共七组（时间戳、refermsg、trace 默认关、去凭证 print、state_path/reset_session、MsgID 返回、登录网络错误不作废二维码），见 `gateway/wxbot/README.md`。
+
+健康语义变化：无 DING/DONG 等价物，probe 为进程内状态，新鲜度由接收循环 synccheck 周期（约 25–40 秒）界定；发送预检 + 「发送结果不确定」分类保留关键安全性质。自发送回显以服务器 MsgID + 30 秒窗口精确文本双保险过滤。
+
+本机 Python 全量 188 项通过（1 项协议集成测试在安装 httpx 的独立 venv 中通过：MockTransport 模拟 jslogin→408/201/200 登录轮询→webwxnewloginpage→webwxinit→synccheck/webwxsync→文本与引用回复收取→webwxsendmsg 发送→会话落盘全链路，驱动真实 vendored 协议核心）；前端测试重写微信配置段（无模式/令牌/联系人/头像断言）后通过。删除 Node bridge/UOS/timestamp 三组兼容测试、avatar 测试与 sidecar 部署件。
+
+**实测（2026-10-08，全部通过）**：`--remove-orphans` 退役旧 sidecar，单容器 2.2.0 健康；真实扫码登录（二维码为本地渲染的登录 URL SVG）后自动绑定文件传输助手，无联系人步骤；并发双 ask 实测：`transport_message_id` 首次取得真实服务器 MsgID，第二条自动附带引用提示行；用户先引用回复第一条、再普通回复第二条——引用回复按扁平文本送达（「昵称：引用原文」+ 分割线，与 2026-10-06 记录一致，refermsg 补丁为另一线上形态兜底），归属正确且保存正文仅含用户输入，普通回复归属唯一等待项；高效模式 inbox 领取两条（kind=reply、CreateTime 真实时间戳）并 ack；容器重启两次均免扫码恢复会话；手机端退出网页登录后一个周期内自动回到 awaiting_scan 并生成新二维码，被踢账号重登多次被服务器拒绝后成功（符合服务端冷却特征）。
+
+实测后追加两项健壮性修复：凭据存在但未登录时先经 synccheck 在线核实再决定重置（瞬时 init 失败的新凭据不再被误清、不再强制重扫）；恢复的乐观登录若缺 synckey（init 从未完成）先重置再走全新登录，避免「看似登录却收不到消息」的静默状态。两套环境（标准库 190 项 / httpx venv 190 项含协议集成）复测通过。
+
+**头像与界面增强（同日追加，头像显示待实测）**：vendored 补丁 H 在登录轮询 201 响应捕获 `window.userAvatar`（官方登录页同源），`reset_session` 随登录状态一并清空；恢复会话用 `webwxgeticon` 拉取兜底（图片类型与 512 KiB 上限校验、1 小时缓存）。前端新增面板式登录步骤条（连接微信服务 → 待扫码 → 待确认 → 登录，登录后隐藏）与邮箱启用开关（停用保留凭据、退出路由/回退/IMAP 轮询）。步骤条、开关与头像的渲染逻辑均有前端测试；头像在真机扫码后的显示待下次扫码实测确认。

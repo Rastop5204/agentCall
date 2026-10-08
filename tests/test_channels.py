@@ -36,12 +36,6 @@ class FakeWechat:
         self.probes += 1
         return self.status()
 
-    def contacts(self, query='', limit=100):
-        return [{'id': 'user-1', 'name': '用户', 'alias': '目标'}]
-
-    def contact(self, contact_id):
-        return next((c for c in self.contacts() if c['id'] == contact_id), None)
-
     def send(self, record, concurrent_waiting=False):
         if self.failure:
             raise self.failure
@@ -53,6 +47,9 @@ class FakeWechat:
         self.notes.append((account_id, contact_id, text))
         return True
 
+    def avatar(self):
+        return {'account_id': self.account_id if self.online else None, 'image': None}
+
 
 class ChannelTests(unittest.TestCase):
     def setUp(self):
@@ -62,7 +59,9 @@ class ChannelTests(unittest.TestCase):
         self.mail = Mock()
         self.app = Gateway(self.store, self.mail, wechat_transport=self.wx)
         self.app.save_config(CONFIG)
-        self.app.save_wechat_config({'enabled': True, 'target_contact_id': 'user-1'})
+        self.app.save_wechat_config({'enabled': True})
+        # Login binds the filehelper conversation to the signed-in account.
+        self.app.channels.on_event({'type': 'logged_in'})
 
     def tearDown(self):
         self.store.close()
@@ -72,7 +71,7 @@ class ChannelTests(unittest.TestCase):
         return self.app.create('ask', dict(subject='选择下一步', body='A or B?', **extra))
 
     def incoming(self, record, **extra):
-        item = dict(message_id='wx-in-1', from_contact_id='user-1', account_id='bot-1',
+        item = dict(message_id='wx-in-1', from_contact_id='filehelper', account_id='bot-1',
                     body='[AC:' + record['id'] + '] 选择 A', received_at=datetime.now(timezone.utc).isoformat())
         item.update(extra)
         return self.app.receive_wechat(item)
@@ -86,7 +85,7 @@ class ChannelTests(unittest.TestCase):
         self.mail.send_message.assert_not_called()
         stored = self.store.get(record['id'])
         self.assertEqual(stored['channel'], 'wechat')
-        self.assertEqual(stored['recipient_label'], '目标')
+        self.assertEqual(stored['recipient_label'], '文件传输助手')
         self.assertEqual(stored['status'], 'waiting')
         self.assertTrue(stored['transport_message_id'])
 
@@ -246,20 +245,20 @@ class ChannelTests(unittest.TestCase):
         self.incoming(record)
         self.assertEqual(self.wx.notes, [])  # event-thread delivery is deferred
         self.app.deliver_wechat_feedback()
-        self.assertEqual(self.wx.notes, [('bot-1', 'user-1', 'Agent 已读')])
+        self.assertEqual(self.wx.notes, [('bot-1', 'filehelper', 'Agent 已读')])
         self.incoming(record, message_id='wx-in-2', body='补充说明')
         self.app.deliver_wechat_feedback()
-        self.assertEqual(self.wx.notes, [('bot-1', 'user-1', 'Agent 已读')])
+        self.assertEqual(self.wx.notes, [('bot-1', 'filehelper', 'Agent 已读')])
 
     def test_wechat_feedback_on_timeout_and_late_reply(self):
         record = self.create(timeout_seconds=30)
         self.app.send_once()
         self.store.expire(datetime.now(timezone.utc) + timedelta(seconds=70))
         self.app.deliver_wechat_feedback()
-        self.assertEqual(self.wx.notes, [('bot-1', 'user-1', 'Agent 不再等待你的回复')])
+        self.assertEqual(self.wx.notes, [('bot-1', 'filehelper', 'Agent 不再等待你的回复')])
         self.incoming(record, message_id='wx-in-3')
         self.app.deliver_wechat_feedback()
-        self.assertEqual(self.wx.notes[-1], ('bot-1', 'user-1', '回复已记录（已逾期）'))
+        self.assertEqual(self.wx.notes[-1], ('bot-1', 'filehelper', '回复已记录（已逾期）'))
 
     def test_wechat_feedback_when_reply_cannot_be_attributed(self):
         first, second = self.create(), self.create()
@@ -267,7 +266,7 @@ class ChannelTests(unittest.TestCase):
         self.app.send_once()
         self.incoming(first, message_id='wx-in-1', body='同意')
         self.app.deliver_wechat_feedback()
-        self.assertEqual(self.wx.notes, [('bot-1', 'user-1',
+        self.assertEqual(self.wx.notes, [('bot-1', 'filehelper',
             '无法确定你的回复对应哪个问题，请引用对应消息回复，或在回复中带上 [AC:编号]')])
 
     def test_stray_message_without_waiting_ask_gets_no_feedback(self):
@@ -378,19 +377,36 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(stored['reply']['body'], '选择 A')
         self.assertTrue(stored['reply']['unconfirmed'])
 
-    def test_account_switch_requires_reselecting_target(self):
+    def test_account_switch_rebinds_on_login_and_guards_old_records(self):
+        first = self.create()
+        self.app.send_once()
         self.wx.account_id = 'bot-2'
         record = self.create()
         self.app.send_once()
         self.assertEqual(self.store.get(record['id'])['channel'], 'email')
         self.assertEqual(self.store.get(record['id'])['fallback_reason']['code'], 'WECHAT_ACCOUNT_CHANGED')
+        # A fresh login event re-binds the conversation to the new account…
+        self.app.channels.on_event({'type': 'logged_in'})
+        self.assertEqual(self.app.channels.config()['account_id'], 'bot-2')
+        # …while records bound to the previous account stay guarded.
+        second = self.create()
+        self.app.send_once()
+        self.assertEqual(self.store.get(second['id'])['channel'], 'wechat')
+        self.incoming(first, message_id='wx-in-8', account_id='bot-2')
+        self.assertEqual(self.store.get(first['id'])['status'], 'waiting')
 
-    def test_token_is_private_and_target_change_is_blocked_while_waiting(self):
-        self.app.save_wechat_config({'mode': 'external', 'service_endpoint': 'puppet.example.com:8788', 'service_token': 'secret-value'})
+    def test_legacy_contact_config_is_migrated_and_requires_rebind(self):
+        self.store.set_setting('wechat_config', {'enabled': True, 'mode': 'external',
+            'service_endpoint': 'puppet.example.com:8788', 'service_token': 'secret-value',
+            'target_contact_id': 'wxid_user', 'target_contact_name': '用户', 'account_id': 'bot-1'})
+        config = self.app.channels.config()
+        self.assertEqual(config, {'enabled': True, 'target_contact_id': '',
+                                  'target_contact_name': '', 'account_id': ''})
+        self.assertEqual(self.app.channels.config(), config)  # sanitized once, then stable
+        status = self.app.channels.status()
+        self.assertFalse(status['available'])
+        self.assertEqual(status['error']['code'], 'WECHAT_TARGET_REQUIRED')
         self.assertNotIn('secret-value', json.dumps(self.app.wechat_view()))
-        self.create()
-        with self.assertRaises(APIError):
-            self.app.save_wechat_config({'target_contact_id': 'other'})
 
     def test_wechat_only_configuration_can_send_without_email(self):
         self.store.set_setting('config', {})
@@ -402,15 +418,33 @@ class ChannelTests(unittest.TestCase):
     def test_waiting_email_does_not_block_wechat_setup(self):
         record = self.create(channel='email')
         self.app.send_once()
-        self.app.save_wechat_config({'target_contact_id': ''})
-        self.app.save_wechat_config({'target_contact_id': 'user-1'})
+        self.app.save_wechat_config({'enabled': True})
         self.assertEqual(self.store.get(record['id'])['status'], 'waiting')
 
-    def test_waiting_wechat_still_protects_its_contact(self):
+    def test_waiting_wechat_still_blocks_config_changes(self):
         self.create()
         self.app.send_once()
         with self.assertRaises(APIError):
-            self.app.save_wechat_config({'target_contact_id': ''})
+            self.app.save_wechat_config({'enabled': False})
+
+    def test_disabled_email_keeps_credentials_but_leaves_routing(self):
+        self.store.set_setting('config', dict(self.store.config(), enabled=False))
+        record = self.create()
+        self.app.send_once()
+        self.assertEqual(self.store.get(record['id'])['channel'], 'wechat')  # 微信可用时不受影响
+        self.wx.online = False
+        with self.assertRaises(APIError):
+            self.create()  # 微信离线且邮箱停用：没有可用通道
+        self.wx.online = True
+        from gateway.wechat import WechatError
+        self.wx.failure = WechatError('WECHAT_OFFLINE', '离线', '', safe_to_fallback=True)
+        failing = self.create()
+        self.app.send_once()
+        self.assertEqual(self.store.get(failing['id'])['status'], 'failed')  # 不回退到停用的邮箱
+        self.mail.send_message.assert_not_called()
+        self.wx.failure = None
+        self.app.poll_once()
+        self.mail.poll_replies.assert_not_called()  # 停用时停止 IMAP 轮询
 
     def test_legacy_record_defaults_to_email_channel(self):
         record = self.create(channel='email')

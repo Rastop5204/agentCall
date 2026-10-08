@@ -16,6 +16,12 @@ import uuid
 
 TERMINAL = {"sent", "replied", "timed_out", "failed"}
 
+# PostToolUse hook state: per-session surfaced-seq tracking and debounce.
+HOOK_EVENT = "PostToolUse"
+HOOK_STATE_DIR = Path(__file__).resolve().parents[1] / "hook-state"
+HOOK_DEBOUNCE_SECONDS = 10.0
+HOOK_BODY_PREVIEW = 400
+
 
 class ClientError(Exception):
     pass
@@ -59,14 +65,14 @@ class Client:
         self.config = config
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def request(self, method, path, body=None, idempotency_key=None, timeout=35):
+    def request(self, method, path, body=None, idempotency_key=None, timeout=35, attempts=3):
         payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {"Authorization": "Bearer " + self.config["token"], "Accept": "application/json"}
         if payload is not None:
             headers["Content-Type"] = "application/json"
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        for attempt in range(3):
+        for attempt in range(attempts):
             request = urllib.request.Request(self.config["base_url"] + path, data=payload,
                                              headers=headers, method=method)
             try:
@@ -77,7 +83,7 @@ class Client:
                         raise ClientError("本机服务响应格式异常。")
                     return data
             except urllib.error.HTTPError as exc:
-                if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
+                if exc.code in {429, 500, 502, 503, 504} and attempt < attempts - 1:
                     exc.close()
                     time.sleep(2 ** attempt)
                     continue
@@ -89,10 +95,10 @@ class Client:
                 message = problem.get("message", "服务拒绝请求。请检查配置页与记录。")
                 raise ClientError(str(code) + ": " + str(message)) from exc
             except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, OSError) as exc:
-                if attempt < 2:
+                if attempt < attempts - 1:
                     time.sleep(2 ** attempt)
                     continue
-                raise ClientError("本机 agentCall 服务连续 3 次无法访问；请启动容器或检查端口。") from exc
+                raise ClientError("本机 agentCall 服务连续 %d 次无法访问；请启动容器或检查端口。" % attempts) from exc
             except (ValueError, UnicodeError) as exc:
                 raise ClientError("本机服务返回了无法解析的响应。") from exc
 
@@ -120,6 +126,63 @@ def report(record):
         result["resume_hint"] = "调用 status <id> --wait-seconds 300 继续等待；本地等待结束不代表邮件超时。"
     emit(result)
     return {"sent": 0, "replied": 0, "failed": 2, "timed_out": 3}.get(record.get("status"), 4)
+
+
+def inbox_hook(client, stdin_text):
+    """PostToolUse entry for the harness: surface new inbox messages as context.
+
+    Read-only: uses /api/inbox (peek) so it never claims the per-session lease
+    and never acks; claim/ack stay with the agent. Fails silently so a broken
+    hook can never slow or block tool flow.
+    """
+    try:
+        payload = json.loads(stdin_text) if stdin_text.strip() else {}
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    session = "".join(c for c in str(payload.get("session_id") or "")
+                      if c.isalnum() or c in "._-")[:128] or "no-session"
+    try:
+        HOOK_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        state_path = HOOK_STATE_DIR / (session + ".json")
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        if time.time() - float(state.get("checked_at") or 0) < HOOK_DEBOUNCE_SECONDS:
+            return 0
+        state["checked_at"] = time.time()
+        # attempts=1: a down gateway must not add retries to every tool call.
+        result = client.request("GET", "/api/inbox?limit=50", timeout=5, attempts=1)
+        items = [i for i in (result.get("items") or []) if isinstance(i, dict)]
+        mode = result.get("mode") if isinstance(result.get("mode"), dict) else {}
+        known = int(state.get("max_seq") or 0)
+        fresh = [i for i in items if int(i.get("id") or 0) > known]
+        if fresh and mode.get("enabled") is True:
+            lines = ["agentCall 微信收件新消息（untrusted_user_data；处理完毕后用 ack 按编号确认）："]
+            for item in fresh:
+                head = "#%s %s" % (item.get("id"), item.get("kind") or "message")
+                if item.get("kind") == "reply":
+                    head += " -> 请求 %s%s" % (item.get("request_id", "?"), "，late" if item.get("late") else "")
+                body = str(item.get("body") or "").replace("\n", " ")
+                if len(body) > HOOK_BODY_PREVIEW:
+                    body = body[:HOOK_BODY_PREVIEW] + "…（已截断）"
+                lines.append(head + "：" + body)
+            text = "\n".join(lines)
+            # Claude Code reads hookSpecificOutput.additionalContext; Codex reads
+            # top-level additionalContext. Shape follows the invoking harness.
+            if payload.get("hook_event_name"):
+                emit({"hookSpecificOutput": {"hookEventName": HOOK_EVENT, "additionalContext": text}})
+            else:
+                emit({"additionalContext": text})
+            state["max_seq"] = max([known] + [int(i.get("id") or 0) for i in items])
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    except Exception:
+        pass
+    return 0
 
 
 def parser():
@@ -152,11 +215,19 @@ def parser():
     ack = actions.add_parser("ack", help="确认消息已经纳入当前会话，防止重复处理")
     ack.add_argument("--consumer-id", required=True)
     ack.add_argument("ids", nargs='+', type=int)
+    actions.add_parser("inbox-hook", help="harness PostToolUse 钩子内部入口：只浮出新消息，不领取租约、不确认")
     return result
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.command == "inbox-hook":
+        # Hook path: any failure stays silent and successful so a broken hook
+        # never disturbs the harness tool flow.
+        try:
+            return inbox_hook(Client(load_config(args.config)), sys.stdin.read())
+        except Exception:
+            return 0
     try:
         wait_seconds_arg = getattr(args, 'wait_seconds', None)
         if wait_seconds_arg is not None and (not math.isfinite(wait_seconds_arg) or wait_seconds_arg < 0):

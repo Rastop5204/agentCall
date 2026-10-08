@@ -153,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
             raise APIError('SKILL_UNAVAILABLE', 'Skill 模板尚未安装。', status=503)
         with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(folder.rglob('*')):
-                if path.is_file() and '__pycache__' not in path.parts and path.suffix != '.pyc' and path.name != 'config.json':
+                if path.is_file() and '__pycache__' not in path.parts and 'hook-state' not in path.parts and path.suffix != '.pyc' and path.name != 'config.json':
                     archive.write(path, 'agentcall/' + path.relative_to(folder).as_posix())
             config = {'base_url': f'http://127.0.0.1:{self.server.server_address[1]}', 'token': self.server.app.store.token()}
             info = zipfile.ZipInfo('agentcall/config.json')
@@ -210,10 +210,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, app.live.peek(limit))
             if path == '/api/wechat':
                 return self.respond(200, app.wechat_view(probe=query.get('probe', ['0'])[0] == '1'))
-            if path == '/api/wechat/contacts':
-                return self.respond(200, app.channels.contacts(query.get('q', [''])[0]))
-            if path == '/api/wechat/avatar':
-                return self.respond(200, app.channels.wechat.avatar())
             if path == '/api/config':
                 return self.respond(200, app.config_view())
             if path == '/api/token':

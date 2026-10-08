@@ -183,14 +183,8 @@ const state = {
   wechatStatus: null,
   wechatDirty: false,
   wechatEditVersion: 0,
-  contacts: [],
-  contactsLoaded: false,
-  selectedContact: null,
-  wechatContactDirty: false,
-  contactSearchVersion: 0,
   wechatRefreshing: false,
   wechatSignature: "",
-  wechatAvatar: null,
   wechatConfigSignature: "",
   efficientMode: null,
   efficientDirty: false,
@@ -431,6 +425,8 @@ function applyConfig(data) {
     ? "已保存 · 留空保留现有密码"
     : "输入邮箱服务提供的应用专用密码";
   $("#password-state").textContent = config.password_set ? "已保存" : "";
+  $("#email-enabled").checked = config.enabled !== false;
+  $("#config-form").classList.toggle("channel-disabled", config.enabled === false);
   state.dirty = false;
   $("#save-status").className = "";
   $("#save-status").innerHTML = `${icon("lock")}配置与记录保存在本机`;
@@ -445,10 +441,10 @@ function markDirty() {
   $("#save-status").innerHTML = `${icon("info")}有尚未保存的更改`;
 }
 function emailConfigured(config = state.config) {
-  return Boolean(config?.email && config?.target_email && config?.password_set);
+  return Boolean(config?.email && config?.target_email && config?.password_set && config?.enabled !== false);
 }
 function wechatConfigured(config = state.wechat) {
-  return Boolean(config?.enabled && config?.target_contact_id);
+  return Boolean(config?.enabled && config?.account_id);
 }
 function testChannel() {
   return $("#test-channel").value || "auto";
@@ -463,7 +459,7 @@ function hasSavedConfig(channel = testChannel(), connectionOnly = false) {
   if (connectionOnly && channel === "wechat") return true;
   const ready = channel === "wechat" ? wechatConfigured() : channel === "email" ? emailConfigured() : wechatConfigured() || emailConfigured();
   if (!ready) {
-    toast(channel === "wechat" ? "请先启用微信、选择联系人并保存配置。" : channel === "email" ? "请先填写并保存发件邮箱、应用专用密码和目标邮箱。" : "请先保存微信联系人或完整的邮箱配置。", true);
+    toast(channel === "wechat" ? "请先启用微信并扫码登录。" : channel === "email" ? "请先填写并保存发件邮箱、应用专用密码和目标邮箱。" : "请先保存微信配置（扫码登录）或完整的邮箱配置。", true);
     return false;
   }
   return true;
@@ -483,8 +479,21 @@ function updateProgress() {
   });
   $("#setup-progress").textContent = `${completed.filter(Boolean).length} / 3`;
 }
+const journeyPanel = $(".journey-panel");
+if (storage.get("journey-dismissed") === "yes") journeyPanel.hidden = true;
+$("#dismiss-journey").addEventListener("click", () => {
+  journeyPanel.hidden = true;
+  storage.set("journey-dismissed", "yes");
+});
+const localService = $(".local-service");
+localService.addEventListener("toggle", () => {
+  $(".sidebar").classList.toggle("service-open", localService.open);
+});
 $("#config-form").addEventListener("input", markDirty);
 $("#config-form").addEventListener("change", markDirty);
+$("#email-enabled").addEventListener("change", () => {
+  $("#config-form").classList.toggle("channel-disabled", !$("#email-enabled").checked);
+});
 $("#config-form").addEventListener(
   "invalid",
   (event) => {
@@ -511,6 +520,7 @@ $("#config-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const data = Object.fromEntries(new FormData(event.currentTarget));
   data.provider = state.provider;
+  data.enabled = $("#email-enabled").checked;
   [
     "email",
     "username",
@@ -589,7 +599,8 @@ $$("[data-channel-tab]").forEach((button) => {
   });
 });
 function updateChannelLabels() {
-  $("#email-tab-status").textContent = emailConfigured() ? "已配置" : "未配置";
+  $("#email-tab-status").textContent = emailConfigured() ? "已配置"
+    : state.config?.password_set && state.config?.enabled === false ? "已停用" : "未配置";
   $("#wechat-tab-status").textContent = state.wechatStatus?.available ? "已就绪" : state.wechatStatus?.logged_in ? "已登录" : state.wechat?.enabled ? "待登录" : "未启用";
 }
 function markWechatDirty() {
@@ -597,11 +608,6 @@ function markWechatDirty() {
   state.wechatEditVersion += 1;
   $("#wechat-save-status").className = "dirty";
   $("#wechat-save-status").innerHTML = `${icon("info")}有尚未保存的更改`;
-}
-function updateWechatMode() {
-  const external = $("#wechat-mode").value === "external";
-  $("#wechat-external-settings").hidden = !external;
-  $("#wechat-endpoint").required = external;
 }
 function applyWechat(data, preserveEdits = true) {
   if (data.efficient_mode) applyEfficientMode(data.efficient_mode);
@@ -611,18 +617,9 @@ function applyWechat(data, preserveEdits = true) {
     const config = state.wechat || {};
     state.wechatConfigSignature = configSignature;
     $("#wechat-enabled").checked = Boolean(config.enabled);
-    $("#wechat-mode").value = config.mode || "local";
-    $("#wechat-endpoint").value = config.service_endpoint || "";
-    $("#wechat-token").value = "";
-    $("#wechat-token").placeholder = config.service_token_set ? "已保存 · 留空保留现有令牌" : "输入外部服务的访问令牌";
-    $("#wechat-token-state").textContent = config.service_token_set ? "已保存" : "";
-    state.selectedContact = config.target_contact_id ? { id: config.target_contact_id, name: config.target_contact_name || config.target_contact_id } : null;
-    state.wechatContactDirty = false;
     state.wechatDirty = false;
     $("#wechat-save-status").className = "";
     $("#wechat-save-status").innerHTML = `${icon("lock")}配置与登录会话持久保存`;
-    updateWechatMode();
-    renderContacts();
   }
   if (data.status) renderWechatStatus(data.status);
   updateChannelLabels();
@@ -647,56 +644,60 @@ $("#save-efficient-mode").addEventListener("click", () => withBusy($("#save-effi
   applyEfficientMode(mode);
   toast(mode.enabled ? "高效模式已开启。使用更新后的 Skill 收取微信消息。" : "高效模式已关闭，历史消息保留。");
 }));
+function wechatActiveStep(status, hasQr) {
+  // Login progress: 0 连接微信服务 → 1 待扫码 → 2 待确认 → 3 登录.
+  // Returns null once logged in (or fully disabled): the bar is then hidden.
+  if (status.logged_in || status.state === "disabled") return null;
+  if (["connecting", "starting"].includes(status.state)) return 0;
+  if (hasQr && ["Scanned", "Confirmed"].includes(status.qr_status)) return 2;
+  if (status.state === "awaiting_scan" || hasQr) return 1;
+  return 0;
+}
 function renderWechatStatus(status) {
   state.wechatStatus = status;
-  const accountId = status.logged_in ? status.account?.id : null;
-  if (state.wechatAvatar?.accountId !== accountId) state.wechatAvatar = null;
-  if (accountId) void loadWechatAvatar(accountId);
-  const avatar = state.wechatAvatar?.image;
-  const safeAvatar = typeof avatar === "string" && avatar.length < 710000 && /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(avatar);
-  const signature = JSON.stringify([status.state, status.logged_in, status.available, status.account, status.qr_image, status.qr_status, status.error, avatar]);
+  const signature = JSON.stringify([status.state, status.logged_in, status.available, status.account, status.qr_image, status.qr_status, status.avatar_image, status.error]);
   if (signature === state.wechatSignature) return;
   state.wechatSignature = signature;
-  const labels = { disabled: "微信未启用", stopped: "微信已停止", starting: "正在启动微信连接", connecting: "正在连接微信服务", scanning: "等待扫码登录", scan: "等待扫码登录", waiting_scan: "等待扫码登录", awaiting_scan: "等待扫码登录", waiting_login: "等待扫码登录", logged_out: "微信当前未登录", error: "微信连接遇到问题", unavailable: "微信暂时不可用" };
   const loggedIn = Boolean(status.logged_in);
   const qr = status.qr_image;
   const safeImage = typeof qr === "string" && /^data:image\/(?:svg\+xml|png);base64,[A-Za-z0-9+/=\s]+$/.test(qr);
-  const activeScan = safeImage && status.state === "awaiting_scan" && !status.error;
-  $("#wechat-status-title").textContent = loggedIn ? `已登录${status.account?.name ? ` · ${status.account.name}` : ""}` : labels[status.state] || "微信尚未登录";
-  if (!loggedIn && activeScan && status.qr_status === "Scanned") $("#wechat-status-title").textContent = "已扫码，请在手机上确认登录";
-  if (!loggedIn && activeScan && status.qr_status === "Confirmed") $("#wechat-status-title").textContent = "手机已确认，正在完成网页登录";
-  $("#wechat-status-description").textContent = status.available ? "微信当前可用，将优先用于下一次 Agent 消息。" : loggedIn ? "选择并保存一位目标联系人后，即可发送消息。" : "微信不可用时，Agent 会自动使用已配置的邮箱。";
-  $(".status-dot", $("#wechat-status")).className = `status-dot ${loggedIn ? "online" : status.error ? "error" : ""}`;
+  const activeStep = wechatActiveStep(status, safeImage);
+  const steps = $("#wechat-steps");
+  steps.hidden = activeStep === null;
+  $$("#wechat-steps li").forEach((item, index) => {
+    const done = index < activeStep;
+    item.classList.toggle("done", done);
+    item.classList.toggle("active", index === activeStep);
+    item.querySelector(".step-index").innerHTML = done ? icon("check") : String(index + 1);
+  });
   $("#wechat-error").hidden = !status.error;
   $("#wechat-error").innerHTML = status.error ? `<strong>${escapeHTML(status.error.message || "微信连接失败")}</strong>${status.error.hint ? `<p>${escapeHTML(status.error.hint)}</p>` : ""}${status.error.code ? `<code>${escapeHTML(status.error.code)}</code>` : ""}` : "";
-  $("#wechat-qr").innerHTML = loggedIn ? safeAvatar ? `<img class="wechat-avatar" src="${escapeHTML(avatar)}" alt="${escapeHTML(status.account?.name || "当前微信")}的头像"/>` : `<div class="qr-placeholder connected">${icon("check")}<span>微信已登录</span></div>` : safeImage ? `<img src="${escapeHTML(qr)}" alt="使用微信扫描此二维码并在手机上确认登录"/>` : `<div class="qr-placeholder">${icon("qr")}<span>${status.state === "starting" ? "正在获取登录二维码…" : "登录二维码会显示在这里"}</span></div>`;
-  if (loggedIn && safeAvatar) $("#wechat-qr .wechat-avatar").addEventListener("error", () => {
-    if (state.wechatAvatar?.image !== avatar) return;
-    state.wechatAvatar.image = null;
-    state.wechatAvatar.attemptAt = Date.now();
-    renderWechatStatus(state.wechatStatus);
+  const avatar = status.avatar_image;
+  const safeAvatar = typeof avatar === "string" && avatar.length < 710000 && /^data:image\/(?:jpeg|png|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(avatar);
+  // The avatar shows from 待确认 onward, until the login state is lost.
+  const showAvatar = safeAvatar && (loggedIn || activeStep === 2);
+  $("#wechat-qr").classList.toggle("avatar", showAvatar);
+  $(".wechat-login-layout").classList.toggle("avatar", showAvatar);
+  $("#wechat-qr").innerHTML = showAvatar
+    ? `<img class="wechat-avatar" src="${escapeHTML(avatar)}" alt="${escapeHTML(status.account?.name || "当前微信")}的头像"/>`
+    : loggedIn
+      ? `<div class="qr-placeholder connected">${icon("check")}<span>微信已登录</span></div>`
+      : activeStep === 2
+        ? `<div class="qr-placeholder connected">${icon("check")}<span>已扫码，等待手机确认</span></div>`
+        : safeImage
+          ? `<img src="${escapeHTML(qr)}" alt="使用微信扫描此二维码并在手机上确认登录"/>`
+          : `<div class="qr-placeholder">${icon("qr")}<span>${status.state === "starting" ? "正在获取登录二维码…" : "登录二维码会显示在这里"}</span></div>`;
+  if (showAvatar) $("#wechat-qr .wechat-avatar").addEventListener("error", () => {
+    if (state.wechatStatus?.avatar_image !== avatar) return;
+    state.wechatSignature = "";
+    renderWechatStatus({ ...state.wechatStatus, avatar_image: null });
   }, { once: true });
   $("#wechat-login-title").textContent = loggedIn ? "连接已经建立" : safeImage ? "用微信扫一扫" : "从一次扫码开始";
-  $("#wechat-login-help").textContent = loggedIn ? "登录会话保存在本机。断开并停用后，重新启用可恢复仍有效的会话；更换微信账号后需重新选择联系人。" : safeImage ? "请使用微信扫描二维码并在手机确认。二维码过期时，点击刷新二维码。" : "点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新选择目标联系人。";
+  $("#wechat-login-help").textContent = loggedIn ? "登录会话保存在本机。断开并停用后，重新启用可恢复仍有效的会话；更换微信账号后请重新扫码登录。" : safeImage ? "请使用微信扫描二维码并在手机确认。二维码过期时，点击刷新二维码。" : "点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新扫码登录。";
   $("#wechat-login").hidden = loggedIn;
   if (!$("#wechat-login").disabled) $("#wechat-login").innerHTML = `${icon("qr")}${safeImage ? "刷新二维码" : "扫码登录"}`;
   $("#wechat-logout").hidden = !loggedIn;
-  $("#wechat-load-contacts").disabled = !loggedIn;
   updateChannelLabels();
-}
-async function loadWechatAvatar(accountId) {
-  const cached = state.wechatAvatar;
-  if (cached?.accountId === accountId && (cached.pending || Date.now() - cached.attemptAt < (cached.image ? 3600000 : 60000))) return;
-  const entry = state.wechatAvatar = { accountId, image: cached?.image || null, pending: true, attemptAt: Date.now() };
-  try {
-    const result = await api("/api/wechat/avatar");
-    if (state.wechatAvatar !== entry || !state.wechatStatus?.logged_in || state.wechatStatus.account?.id !== accountId) return;
-    entry.image = result.account_id === accountId ? result.image : null;
-  } catch { /* The login indicator remains usable without an avatar. */ }
-  finally {
-    entry.pending = false;
-    if (state.wechatAvatar === entry && state.wechatStatus) renderWechatStatus(state.wechatStatus);
-  }
 }
 async function refreshWechat(probe = false) {
   if (state.wechatRefreshing) return;
@@ -705,16 +706,7 @@ async function refreshWechat(probe = false) {
   finally { state.wechatRefreshing = false; }
 }
 function wechatFormData() {
-  return {
-    enabled: $("#wechat-enabled").checked,
-    mode: $("#wechat-mode").value || "local",
-    service_endpoint: $("#wechat-endpoint").value.trim(),
-    service_token: $("#wechat-token").value,
-    ...(state.wechatContactDirty ? {
-      target_contact_id: state.selectedContact?.id || "",
-      target_contact_name: state.selectedContact?.alias || state.selectedContact?.name || "",
-    } : {}),
-  };
+  return { enabled: $("#wechat-enabled").checked };
 }
 async function saveWechatConfig() {
   if (state.pendingTest && (state.pendingTest.body.channel || "auto") !== "email")
@@ -727,12 +719,11 @@ async function saveWechatConfig() {
   return result;
 }
 $("#wechat-config-panel").addEventListener("input", (event) => {
-  if (event.target.id !== "wechat-contact-search") markWechatDirty();
+  if (event.target.id !== "efficient-enabled") markWechatDirty();
 });
 $("#wechat-config-panel").addEventListener("change", (event) => {
-  if (event.target.id !== "wechat-contact-search") markWechatDirty();
+  if (event.target.id !== "efficient-enabled") markWechatDirty();
 });
-$("#wechat-mode").addEventListener("change", updateWechatMode);
 $("#wechat-config-panel").addEventListener("submit", (event) => {
   event.preventDefault();
   withBusy($("#save-wechat"), "正在保存", async () => {
@@ -753,52 +744,9 @@ $("#wechat-login").addEventListener("click", async () => {
 $("#wechat-refresh").addEventListener("click", () => withBusy($("#wechat-refresh"), "检查中", () => refreshWechat(true)));
 $("#wechat-logout").addEventListener("click", () => withBusy($("#wechat-logout"), "正在断开并停用", async () => {
   applyWechat(await api("/api/wechat/logout", { method: "POST", body: {} }));
-  state.contacts = [];
-  state.contactsLoaded = false;
-  renderContacts();
   await refreshWechat();
   toast("已断开并停用微信，后续自动发送将使用备用邮箱。有效登录会话仍保留，重新启用时可恢复。");
 }));
-function renderContacts() {
-  const selected = state.selectedContact;
-  $("#wechat-selected-contact").hidden = !selected;
-  $("#wechat-selected-contact").innerHTML = selected ? `<span class="contact-avatar">${escapeHTML((selected.alias || selected.name || "微").slice(0, 1))}</span><span class="contact-name">${escapeHTML(selected.alias || selected.name || selected.id)}<small>当前选择的目标联系人</small></span><button type="button" class="text-button clear-contact" aria-label="清除目标联系人" data-clear-contact>${icon("x")}清除</button>` : "";
-  $("#wechat-contacts").innerHTML = state.contacts.length ? state.contacts.map((contact) => `<button class="contact-option${selected?.id === contact.id ? " selected" : ""}" type="button" data-contact-id="${escapeHTML(contact.id)}" aria-pressed="${selected?.id === contact.id}"><span class="contact-avatar">${escapeHTML((contact.alias || contact.name || "微").slice(0, 1))}</span><span class="contact-name">${escapeHTML(contact.alias || contact.name || contact.id)}${contact.alias && contact.name ? `<small>${escapeHTML(contact.name)}</small>` : ""}<small>${escapeHTML(contact.id)}</small></span>${selected?.id === contact.id ? icon("check") : ""}</button>`).join("") : `<p class="contact-empty">${state.contactsLoaded ? "没有找到联系人。试试其他姓名，或确认已在微信添加对方。" : "登录微信后，获取并选择联系人。"}</p>`;
-}
-async function loadContacts() {
-  const version = ++state.contactSearchVersion;
-  const query = $("#wechat-contact-search").value.trim();
-  $("#wechat-contacts").setAttribute("aria-busy", "true");
-  try {
-    const result = await api(`/api/wechat/contacts?q=${encodeURIComponent(query)}`);
-    if (version !== state.contactSearchVersion) return;
-    state.contacts = result.items || [];
-    state.contactsLoaded = true;
-    renderContacts();
-  } catch (error) {
-    if (version === state.contactSearchVersion) $("#wechat-contacts").innerHTML = `<p class="contact-empty error-text">${escapeHTML(errorMessage(error))}</p>`;
-    throw error;
-  } finally { if (version === state.contactSearchVersion) $("#wechat-contacts").removeAttribute("aria-busy"); }
-}
-$("#wechat-load-contacts").addEventListener("click", () => withBusy($("#wechat-load-contacts"), "获取中", loadContacts));
-let contactSearchTimer;
-$("#wechat-contact-search").addEventListener("input", () => {
-  clearTimeout(contactSearchTimer);
-  if (state.wechatStatus?.logged_in) contactSearchTimer = setTimeout(() => loadContacts().catch(() => {}), 300);
-});
-$("#wechat-contacts").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-contact-id]");
-  const contact = button && state.contacts.find((item) => item.id === button.dataset.contactId);
-  if (contact) { state.selectedContact = contact; state.wechatContactDirty = true; markWechatDirty(); renderContacts(); }
-});
-$("#wechat-selected-contact").addEventListener("click", (event) => {
-  if (event.target.closest("[data-clear-contact]")) {
-    state.selectedContact = null;
-    state.wechatContactDirty = true;
-    markWechatDirty();
-    renderContacts();
-  }
-});
 
 function showPage(page) {
   state.page = page === "records" ? "records" : "config";
@@ -829,7 +777,7 @@ $("#test-connection").addEventListener("click", () => {
   return withBusy($("#test-connection"), "正在检查连接", async () => {
     $("#test-results").hidden = false;
     $("#test-results").textContent =
-      channel === "wechat" ? "正在检查微信服务、登录状态和目标联系人…" : channel === "email" ? "正在分别验证 SMTP 发信与 IMAP 收信，请稍候…" : "正在检查微信优先通道与可用的邮箱连接…";
+      channel === "wechat" ? "正在检查微信服务与登录状态…" : channel === "email" ? "正在分别验证 SMTP 发信与 IMAP 收信，请稍候…" : "正在检查微信优先通道与可用的邮箱连接…";
     try {
       const result = await api(channel === "wechat" ? "/api/wechat/test" : "/api/config/test", {
         method: "POST",
@@ -1302,7 +1250,7 @@ function renderDetail(record) {
   const metadata = [
     [record.kind === "incoming" ? "发件人" : "发起 Agent", escapeHTML(record.agent_name || "Agent")],
     ["消息通道", channelBadge(record)],
-    [record.kind === "incoming" ? "来源联系人" : record.channel === "wechat" ? "目标联系人" : "目标邮箱", escapeHTML(record.recipient_label || record.target_email || record.target_contact_id || "尚未配置")],
+    [record.kind === "incoming" ? "来源联系人" : record.channel === "wechat" ? "对话目标" : "目标邮箱", escapeHTML(record.recipient_label || record.target_email || record.target_contact_id || "尚未配置")],
     [
       "创建时间",
       escapeHTML(

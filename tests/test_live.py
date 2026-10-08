@@ -18,7 +18,7 @@ class LiveInboxTests(unittest.TestCase):
         self.app.live.save({'enabled': True})
 
     def message(self, message_id='message-1', body='随时发来的新要求', **extra):
-        return {'message_id': message_id, 'body': body, 'from_contact_id': 'user-1',
+        return {'message_id': message_id, 'body': body, 'from_contact_id': 'filehelper',
                 'account_id': 'bot-1', 'received_at': stamp(), **extra}
 
     def test_unsolicited_message_is_durable_and_read_is_separate_from_claim(self):
@@ -76,7 +76,7 @@ class LiveInboxTests(unittest.TestCase):
         with self.assertRaises(APIError) as error:
             self.app.live.claim({'consumer_id': 'claude-session-2'})
         self.assertEqual(error.exception.error['code'], 'INBOX_CONSUMER_BUSY')
-        self.store.set_setting('live_consumer', {'id': 'codex-session-1', 'scope': ['bot-1', 'user-1'],
+        self.store.set_setting('live_consumer', {'id': 'codex-session-1', 'scope': ['bot-1', 'filehelper'],
                                                'expires_at': stamp(utcnow() - timedelta(seconds=1))})
         self.assertEqual(self.app.live.claim({'consumer_id': 'claude-session-2'})['items'][0]['id'], event['id'])
         with self.assertRaises(APIError):

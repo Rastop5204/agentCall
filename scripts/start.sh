@@ -33,7 +33,7 @@ fi
 
 docker compose build
 legacy_running="$(python3 scripts/migrate-container.py)"
-if ! docker compose up --no-build -d; then
+if ! docker compose up --no-build --remove-orphans -d; then
   if [[ "$legacy_running" == 'running' ]]; then
     docker compose stop || true
     python3 scripts/migrate-container.py --restore || true

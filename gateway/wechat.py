@@ -1,35 +1,40 @@
-"""Thread-safe Python Wechaty transport with active, event-stream health probes.
+"""Thread-safe 文件传输助手 (filehelper) web-protocol transport.
 
-The SDK is loaded only when WeChat is enabled. Account sessions live in the
-puppet service's persisted memory card; this process never implements WeChat's
-protocol or stores cookies. The 0.10.7 SDK is pinned and runs on Python 3.10.
+The vendored protocol core in gateway/wxbot talks to WeChat's web filehelper
+endpoints directly; this module wraps it in the same gateway façade the rest
+of the app already uses. The conversation is the account's own filehelper
+self-chat, so there are no contacts: the target anchor is the constant
+"filehelper" and the account is auto-bound on login.
+
+Health semantics differ from the old gRPC transport: there is no ding/dong
+round-trip. probe() is state-local; freshness is bounded by the receiver
+loop's synccheck cycle (~40 s). Sends are still preflighted against the
+logged-in identity and classified WECHAT_SEND_UNCERTAIN on failure, so a
+stale session can never silently fall back to email.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import copy
-import json
 import logging
-import os
 import re
-import ssl
 import sqlite3
-import sys
 import threading
 import time
-import uuid
-from datetime import datetime, timedelta, timezone
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from gateway.store import BEIJING
 
 PROBE_TIMEOUT = 3
 OPERATION_TIMEOUT = 20
-LOCAL_ENDPOINT = "agentcall-wechat:8788"
-LOCAL_TOKEN_FILE = "agentcall-wechat-token"
 MAX_TEXT = 32000
+FILEHELPER_ID = "filehelper"
+FILEHELPER_NAME = "文件传输助手"
+QR_URL = "https://login.weixin.qq.com/l/{uuid}"
 
 
 def _now():
@@ -72,291 +77,179 @@ def _error(exc, *, sending=False):
         return exc
     if isinstance(exc, (ImportError, ModuleNotFoundError)):
         return WechatError("WECHAT_SDK_MISSING", "微信组件尚未安装。",
-                           "请使用项目的 Docker 启动器安装 Python Wechaty 及本地微信服务。", True)
-    if getattr(getattr(exc, "status", None), "name", "") in {"UNAUTHENTICATED", "PERMISSION_DENIED"}:
-        return WechatError("WECHAT_AUTH_FAILED", "微信服务拒绝了连接凭据。",
-                           "请检查 Puppet Service 令牌是否正确或已过期。", True)
-    if isinstance(exc, ssl.SSLError):
-        return WechatError("WECHAT_TLS_FAILED", "微信服务的加密连接验证失败。",
-                           "检查外部服务地址、证书和系统时间；不要关闭证书验证。", True)
+                           "请安装 httpx（或使用项目的 Docker 启动器）后重启服务。", True)
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError)):
         return WechatError("WECHAT_UNAVAILABLE", "微信服务未及时响应。",
-                           "请检查微信登录状态和微信服务；可用的邮箱配置会接替新的请求。", True)
+                           "请检查微信登录状态和网络；可用的邮箱配置会接替新的请求。", True)
     return WechatError("WECHAT_UNAVAILABLE", "无法连接微信服务。",
-                       "请确认本地微信容器已启动，或检查外部 Puppet Service 地址和令牌。", True)
+                       "请检查网络与微信登录状态；可用的邮箱配置会接替新的请求。", True)
 
 
-def _connection(config, data_dir):
-    """Only the bundled Docker service is allowed plaintext gRPC."""
-    if config.get("mode", "local") == "local":
-        token_path = Path(data_dir) / "wechat-bridge" / LOCAL_TOKEN_FILE
-        try:
-            token = token_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            raise WechatError("WECHAT_LOCAL_SERVICE_MISSING", "本地微信服务尚未就绪。",
-                              "请使用项目的 Docker 启动器启动微信服务。", True) from None
-        if not token:
-            raise WechatError("WECHAT_LOCAL_SERVICE_MISSING", "本地微信服务尚未就绪。",
-                              "请重启微信服务以生成连接凭据。", True)
-        return {"host": "agentcall-wechat", "port": 8788, "tls": False, "token": token}
-    endpoint = str(config.get("service_endpoint") or "").strip()
-    parsed = urlsplit(endpoint if "://" in endpoint else "https://" + endpoint)
-    try:
-        port = parsed.port or 443
-    except ValueError:
-        port = 0
-    if (parsed.scheme not in {"https", "grpcs"} or not parsed.hostname or not port
-            or parsed.username or parsed.password or parsed.path not in {"", "/"}
-            or parsed.query or parsed.fragment):
-        raise WechatError("WECHAT_CONFIG_INVALID", "微信服务地址格式不正确。",
-                          "外部服务必须使用支持 TLS 的主机及端口，例如 grpcs://wechat.example.com:8788。", True)
-    token = str(config.get("service_token") or "").strip()
-    if not token:
-        raise WechatError("WECHAT_CONFIG_INVALID", "尚未配置微信服务令牌。", "请填写 Puppet Service 令牌。", True)
-    return {"host": parsed.hostname, "port": port, "tls": True, "token": token}
+class _WxBotClient:
+    """Adapter around the vendored filehelper protocol core.
 
-
-class _SDKClient:
-    """A narrow adapter around the published SDK's puppet and user models.
-
-    The upstream initializer prints credentials, performs blocking ICMP probes,
-    and constructs a plaintext channel. Overriding that small initializer keeps
-    the official protocol implementation while enforcing this app's transport
-    policy. The stock plugin event bridge is intentionally not started: it opens
-    an unrelated HTTP listener and hides connection errors in unbounded retries.
+    The receiver loop below is the only place login polling and synccheck run;
+    sends multiplex onto the same event loop through the shared AsyncClient.
+    Inbound items keep the gateway's transport-agnostic contract, anchored to
+    the constant filehelper conversation.
     """
     def __init__(self, connection):
-        self._connection = connection
-        if sys.version_info >= (3, 11):
-            raise WechatError("WECHAT_RUNTIME_UNSUPPORTED", "当前 Python 版本不兼容微信 SDK。",
-                              "请使用项目 Docker 启动器；镜像包含已验证的 Python 3.10 环境。", True)
-        if connection.get("cache_dir"):
-            Path(connection["cache_dir"]).mkdir(mode=0o700, parents=True, exist_ok=True)
-            # The published SDK resolves this variable while importing schema.py.
-            os.environ["CACHE_DIR"] = str(connection["cache_dir"])
-        from pyee import AsyncIOEventEmitter
-        from grpclib.client import Channel
-        from wechaty import Wechaty, WechatyOptions
-        from wechaty_puppet import Puppet
-        from wechaty_puppet.schemas.puppet import PuppetOptions
-        from wechaty_puppet_service import PuppetService
-        from wechaty_grpc.wechaty import PuppetStub
-
-        # The legacy SDK logs message bodies and QR tokens at ordinary levels.
-        # This app records only its own deliberately selected diagnostic fields.
-        for name in list(logging.Logger.manager.loggerDict):
-            if any(part in name.lower() for part in ("wechaty", "puppet", "contact", "message")):
-                logging.getLogger(name).disabled = True
-
-        class SecurePuppetService(PuppetService):
-            def __init__(self):
-                options = PuppetOptions()
-                options.token = connection["token"]
-                options.end_point = connection["host"] + ":" + str(connection["port"])
-                Puppet.__init__(self, options, "agentcall")
-                self.channel = None
-                self._puppet_stub = None
-                self._event_stream = AsyncIOEventEmitter()
-                self.login_user_id = None
-
-            def _init_puppet(self):
-                context = ssl.create_default_context() if connection["tls"] else None
-                self.channel = Channel(host=connection["host"], port=connection["port"], ssl=context)
-                # This is the authority authentication used by the pinned SDK /
-                # Wechaty 0.65 server. TLS hostname verification uses Channel.host.
-                self.channel._authority = connection["token"]
-                self._puppet_stub = PuppetStub(self.channel, metadata={
-                    "authorization": "Wechaty " + connection["token"]})
-
-        self.puppet = SecurePuppetService()
-        self.bot = Wechaty(WechatyOptions(name="agentcall", puppet=self.puppet, puppet_options=PuppetOptions()))
-        self._dongs = {}
+        from gateway.wxbot.direct_bot import WeChatHelperBot  # lazy: keeps stdlib-only checkouts importable
+        self.bot = WeChatHelperBot(state_path=connection["state_path"])
         self._callback = None
-        self._stream_task = None
-        self._accept_scan = not connection.get('reset_login')
-        self._stale_qr = set()
-        self._avatar_cache = None
+        self._seen: deque = deque(maxlen=1000)
+        self._seen_set: set = set()
+        self._sent_texts: deque = deque(maxlen=50)  # (monotonic, text) echo guards
+        self._last_uuid = None
+        self._scan_state = None
+        self._avatar_fetch = None  # (account_id, expires_at, data_uri | None)
+
+    async def avatar(self):
+        """Account avatar as a data URI, from scan capture or a cached fetch.
+
+        The 201-captured avatar lives from 待确认 until reset_session; restored
+        sessions fall back to one bounded webwxgeticon fetch per hour.
+        """
+        bot = self.bot
+        if bot.login_avatar:
+            return {"account_id": bot.user_name or None, "image": bot.login_avatar}
+        if not bot.is_logged_in or not bot.user_name:
+            return {"account_id": None, "image": None}
+        cached = self._avatar_fetch
+        if cached and cached[0] == bot.user_name and cached[1] > time.monotonic():
+            return {"account_id": bot.user_name, "image": cached[2]}
+        image = None
+        fetched = await bot.fetch_self_avatar()
+        if fetched:
+            body, content_type = fetched
+            image = "data:" + content_type + ";base64," + base64.b64encode(body).decode()
+        self._avatar_fetch = (bot.user_name, time.monotonic() + (3600 if image else 60), image)
+        return {"account_id": bot.user_name, "image": image}
+
+    def _remember(self, message_id):
+        if message_id in self._seen_set:
+            return
+        self._seen_set.add(message_id)
+        self._seen.append(message_id)
+        if len(self._seen_set) > self._seen.maxlen + 100:
+            self._seen_set &= set(self._seen)
 
     async def run(self, callback):
         self._callback = callback
-        await self.bot.init_puppet()
-        self.puppet.on("scan", self._scan_event)
-        self.puppet.on("login", lambda payload: callback("login", {"id": payload.contact_id, "name": ""}))
-        self.puppet.on("logout", lambda payload: callback("logout", {}))
-        self.puppet.on("ready", lambda payload: callback("ready", {}))
-        self.puppet.on("error", self._error_event)
-        self.puppet.on("dong", self._dong)
-        self.puppet.on("message", self._message)
-        # AsyncIOEventEmitter sends asynchronous handler failures here.
-        self.puppet._event_stream.on("error", lambda *args: callback("error", {}))
-        self.puppet._init_puppet()
-        if self._connection.get('reset_login'):
-            # Stop before subscribing: the server closes its current event stream
-            # on Stop. Start below then creates a genuinely new browser page.
-            await asyncio.wait_for(self.puppet.puppet_stub.stop(), OPERATION_TIMEOUT)
-            self._connection['reset_login'] = False
-        ready = asyncio.Event()
-        self.puppet.on("heartbeat", lambda payload: ready.set())
-        # Subscribe before Start so an immediate QR/login event cannot be lost.
-        self._stream_task = asyncio.create_task(self.puppet._listen_for_event())
-        ready_task = asyncio.create_task(ready.wait())
+        await self.bot.start()
+        if self.bot.is_logged_in and not (self.bot.synckey or {}).get("List"):
+            # Restored credentials without an initial sync state look logged
+            # in but can never receive messages; drop them for a fresh login.
+            self.bot.reset_session()
+        elif self.bot.is_logged_in and self.bot.user_name:
+            callback("login", {"id": self.bot.user_name, "name": ""})
+        while True:
+            if not self.bot.is_logged_in:
+                if self.bot._has_auth():
+                    # Credentials without a session: either kicked, or a login
+                    # whose init failed after the auth fields were fetched.
+                    # Verify on the wire before dropping anything — a fresh
+                    # partial login can recover; without this check the stale
+                    # credentials would wedge (upstream behavior) and every
+                    # flaky init would force a brand-new QR scan.
+                    if await self.bot.check_login_status(poll=True):
+                        callback("login", {"id": self.bot.user_name, "name": ""})
+                        await self.bot.save_session()
+                        continue
+                    callback("logout", {})
+                    self.bot.reset_session()
+                    continue
+                await self._await_scan()
+            else:
+                messages = await self.bot.get_latest_messages(limit=50)
+                if self.bot.is_logged_in:
+                    for item in messages:
+                        self._forward(item)
+                    await self.bot.save_session()
+                elif self.bot._has_auth():
+                    callback("logout", {})
+                    self.bot.reset_session()
+            await asyncio.sleep(0.5)
+
+    async def _await_scan(self):
+        bot = self.bot
         try:
-            await asyncio.wait({self._stream_task, ready_task}, timeout=3,
-                               return_when=asyncio.FIRST_COMPLETED)
-            if self._stream_task.done():
-                await self._stream_task
-                raise ConnectionError("event stream ended")
-            self._accept_scan = True
-            await asyncio.wait_for(self.puppet.puppet_stub.start(), OPERATION_TIMEOUT)
-            await self._stream_task
-        finally:
-            ready_task.cancel()
-            await asyncio.gather(ready_task, return_exceptions=True)
-        raise ConnectionError("event stream ended")
-
-    def _scan_event(self, payload):
-        if not self._accept_scan:
-            if payload.qrcode:
-                self._stale_qr.add(payload.qrcode)
+            uuid = await bot.ensure_login_uuid()
+        except Exception:
+            raise ConnectionError("login uuid fetch failed") from None
+        if not uuid:
+            raise ConnectionError("no login uuid available")
+        if uuid != self._last_uuid:
+            self._last_uuid, self._scan_state = uuid, None
+            self._callback("scan", {"qr_code": QR_URL.format(uuid=uuid), "qr_status": "Waiting"})
+        await bot.check_login_status(poll=True)  # ~25 s server-side long poll
+        if bot.is_logged_in:
+            self._callback("login", {"id": bot.user_name, "name": ""})
+            await bot.save_session()
             return
-        if payload.qrcode in self._stale_qr:
+        status = bot.last_login_message
+        if status == "scanned_wait_confirm" and self._scan_state != "Scanned":
+            self._scan_state = "Scanned"
+            self._callback("scan", {"qr_code": QR_URL.format(uuid=uuid), "qr_status": "Scanned"})
+        elif status == "qr_expired":
+            # The server dropped the uuid; emit the stale QR removal once and
+            # let the next cycle fetch a fresh one.
+            self._last_uuid, self._scan_state = None, None
+            self._callback("scan", {"qr_code": None, "qr_status": "Expired"})
+
+    def _forward(self, item):
+        if item.get("type") != "text" or not item.get("is_mine"):
+            return  # filehelper system notices and media are not task input.
+        message_id = str(item.get("id") or "")
+        if not message_id or message_id in self._seen_set:
             return
-        self._callback('scan', {'qr_code': payload.qrcode,
-            'qr_status': getattr(payload.status, 'name', str(payload.status))})
-
-    def _dong(self, payload):
-        future = self._dongs.get(payload.data)
-        if future is not None and not future.done():
-            future.set_result(None)
-
-    def _error_event(self, payload):
-        marker = re.search(r'AGENTCALL_LOGIN_REJECTED:(-?\d{1,8}|unknown)', str(getattr(payload, 'data', ''))[:16384])
-        if marker:
-            self._callback('login_failed', {'return_code': marker.group(1)})
-        else:
-            self._callback('error', {})
+        try:
+            create_time = int(item.get("create_time") or 0)
+        except (TypeError, ValueError):
+            create_time = 0
+        if create_time <= 0:
+            return  # Without receipt time an old message must not decide a new request.
+        body = re.sub(r'<br\s*/?>', '\n', str(item.get("text") or ""))
+        if not body or len(body) > MAX_TEXT:
+            return
+        self._remember(message_id)
+        now = time.monotonic()
+        while self._sent_texts and now - self._sent_texts[0][0] > 30:
+            self._sent_texts.popleft()
+        if any(text == body for _, text in self._sent_texts):
+            # Belt-and-braces echo guard: if the server echoes our own send
+            # under a fresh id, an exact-text match within seconds of sending
+            # is our message coming back, not a user reply.
+            return
+        payload = {"message_id": message_id, "from_contact_id": FILEHELPER_ID,
+                   "account_id": self.bot.user_name, "body": body,
+                   "received_at": datetime.fromtimestamp(create_time, timezone.utc
+                       ).isoformat(timespec="seconds").replace("+00:00", "Z")}
+        if item.get("reference_id"):
+            payload["reference_id"] = str(item["reference_id"])
+        self._callback("message", payload)
 
     async def probe(self):
-        nonce = "agentcall-" + uuid.uuid4().hex
-        future = asyncio.get_running_loop().create_future()
-        self._dongs[nonce] = future
-        try:
-            await self.puppet.ding(nonce)
-            # A DONG event proves both the RPC and incoming stream are alive.
-            # Logout events preceding it have already updated login_user_id.
-            await asyncio.wait_for(future, PROBE_TIMEOUT)
-            account_id = self.puppet.login_user_id
-            if not account_id:
-                return None
-            payload = await self.puppet.contact_payload(account_id)
-            if account_id != self.puppet.login_user_id:
-                return None
-            return {"id": account_id, "name": getattr(payload, "name", "") or ""}
-        finally:
-            self._dongs.pop(nonce, None)
+        # State-local: freshness is guaranteed by the receiver loop's synccheck
+        # cycle, not by a wire round-trip on every probe.
+        if self.bot.is_logged_in and self.bot.user_name:
+            return {"id": self.bot.user_name, "name": ""}
+        return None
 
-    async def avatar(self):
-        from gateway.avatar import avatar_image
-        account_id = self.puppet.login_user_id
-        if not account_id:
-            return {'account_id': None, 'image': None}
-        cached = self._avatar_cache
-        if cached and cached[0] == account_id and cached[1] > time.monotonic():
-            return {'account_id': account_id, 'image': cached[2]}
-        image = None
-        try:
-            # SDK FileBox.from_json drops the Cookie header; read the wire box
-            # directly, keeping its URL and credentials entirely server-side.
-            reply = await self.puppet.puppet_stub.contact_avatar(id=account_id)
-            box = json.loads(reply.filebox)
-            image = await asyncio.to_thread(avatar_image, box)
-        except Exception:
-            pass  # A missing avatar must not affect login or message routing.
-        if account_id != self.puppet.login_user_id:
-            return {'account_id': None, 'image': None}
-        self._avatar_cache = (account_id, time.monotonic() + (3600 if image else 60), image)
-        return {'account_id': account_id, 'image': image}
-
-    async def contacts(self, query="", limit=100):
-        ids = await self.puppet.contact_list()
-        own_id = self.puppet.login_user_id
-        result = []
-        # Bound server work even if a corrupt service returns an enormous list.
-        for contact_id in ids[:5000]:
-            if contact_id == own_id:
-                continue
-            payload = await self.puppet.contact_payload(contact_id)
-            if getattr(payload, "friend", True) is False:
-                continue
-            item = {"id": contact_id, "name": getattr(payload, "name", "") or "",
-                    "alias": getattr(payload, "alias", "") or ""}
-            if query.casefold() not in " ".join(item.values()).casefold():
-                continue
-            result.append(item)
-            if len(result) >= limit:
-                break
-        return result
-
-    async def contact(self, contact_id):
-        ids = await self.puppet.contact_list()
-        if contact_id not in ids or contact_id == self.puppet.login_user_id:
-            raise WechatError("WECHAT_CONTACT_NOT_FOUND", "目标不是当前微信账号的联系人。",
-                              "请先在微信中添加好友，再刷新联系人并选择目标。", True)
-        payload = await self.puppet.contact_payload(contact_id)
-        if getattr(payload, "friend", True) is False:
-            raise WechatError("WECHAT_CONTACT_NOT_FOUND", "目标微信联系人尚未添加为好友。",
-                              "请在微信中完成好友添加后重新选择。", True)
-        return {"id": contact_id, "name": getattr(payload, "name", "") or "",
-                "alias": getattr(payload, "alias", "") or ""}
-
-    async def send(self, contact_id, text):
-        return await self.puppet.message_send_text(contact_id, text)
-
-    async def _message(self, payload):
-        try:
-            message = self.bot.Message.load(payload.message_id)
-            await message.ready()
-            if message.is_self() or message.room() is not None:
-                return
-            # Node puppet sends wire type 7; the pinned Python adapter maps it
-            # to its own MESSAGE_TYPE_TEXT = 6 (7 there means video).
-            if int(message.type()) != 6:
-                return
-            # Quoted replies arrive as flattened text with literal <br/> breaks;
-            # one reply, one line feed, keeps every downstream consumer plain.
-            body = re.sub(r'<br\s*/?>', '\n', message.text())
-            if not body or len(body) > MAX_TEXT:
-                return
-            talker_id = message.talker().get_id()
-            account_id = self.puppet.login_user_id
-            if not account_id or talker_id == account_id:
-                return
-            timestamp = getattr(message.payload, "timestamp", None)
-            if not isinstance(timestamp, (int, float)) or timestamp <= 0:
-                return  # Without receipt time an old message must not decide a new request.
-            if timestamp > 100000000000:
-                timestamp /= 1000
-            received_at = datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-            self._callback("message", {"message_id": payload.message_id,
-                "from_contact_id": talker_id, "account_id": account_id,
-                "body": body, "received_at": received_at})
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self._callback("receive_error", {})
+    async def send(self, text):
+        message_id = await self.bot.send_text(text)
+        if message_id:
+            self._sent_texts.append((time.monotonic(), text))
+            self._remember(message_id)
+        return message_id
 
     async def close(self):
-        # Closing the client must not log the account out or erase the puppet's
-        # memory card; a container restart can reconnect to its persisted session.
-        if self.puppet.channel is not None:
-            self.puppet.channel.close()
-        if self._stream_task:
-            self._stream_task.cancel()
-            await asyncio.gather(self._stream_task, return_exceptions=True)
-        for future in self._dongs.values():
-            if not future.done():
-                future.cancel()
-        self._dongs.clear()
+        # Persist the session and close the client without logging out; a
+        # restart reconnects to the saved session without a new scan.
+        try:
+            await asyncio.wait_for(self.bot.stop(), 3)
+        except Exception:
+            pass
 
 
 class WechatGateway:
@@ -364,7 +257,7 @@ class WechatGateway:
         self.data_dir = Path(data_dir)
         self.on_message = on_message or (lambda item: None)
         self.on_event = on_event or (lambda item: None)
-        self._factory = _client_factory or _SDKClient
+        self._factory = _client_factory or _WxBotClient
         self._lock = threading.RLock()
         self._lifecycle = threading.RLock()
         self._config = {}
@@ -401,7 +294,7 @@ class WechatGateway:
     def start(self, config, *, reset_login=False):
         with self._lifecycle:
             config = copy.deepcopy(config or {})
-            keys = ("enabled", "mode", "service_endpoint", "service_token")
+            keys = ("enabled",)
             same = all(config.get(key) == self._config.get(key) for key in keys)
             if same and not reset_login and self._thread and self._thread.is_alive():
                 self._config = config
@@ -410,15 +303,14 @@ class WechatGateway:
             self._config = config
             if not config.get("enabled"):
                 return self.status()
-            try:
-                connection = _connection(config, self.data_dir)
-            except Exception as exc:
-                error = _error(exc)
-                self._set(state="error", error=error.as_dict())
-                self._report("connection_failed", error)
-                return self.status()
+            state_path = self.data_dir / "wxbot" / "state.json"
+            if reset_login:
+                # A fresh scan is requested: drop the persisted session so the
+                # next login cannot silently reuse it.
+                state_path.unlink(missing_ok=True)
+            connection = {"state_path": state_path}
             self._stopping = False
-            connection.update(reset_login=reset_login, generation=self._generation)
+            connection.update(generation=self._generation)
             self._set(state="connecting", error=None)
             self._thread = threading.Thread(target=self._run_thread, args=(connection,), name="agentcall-wechat", daemon=True)
             self._thread.start()
@@ -448,7 +340,8 @@ class WechatGateway:
                 self._client = None
 
     async def _run(self, connection):
-        connection = dict(connection, cache_dir=str(self.data_dir / "wechat-sdk"))
+        connection = dict(connection)
+        Path(connection["state_path"]).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         delay = 1
         generation = connection['generation']
         while not self._stopping and generation == self._generation:
@@ -463,16 +356,13 @@ class WechatGateway:
                         self._event(event, payload)
                 await client.run(current_event)
                 if not self._stopping:
-                    raise ConnectionError("event stream ended")
+                    raise ConnectionError("receiver loop ended")
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception:
                 if generation != self._generation:
                     return
-                error = _error(exc)
-                previous = self.status().get('error') or {}
-                if previous.get('code') == 'WECHAT_LOGIN_REJECTED':
-                    error = WechatError(previous['code'], previous['message'], previous['hint'], True)
+                error = _error(ConnectionError())  # never surface exception text
                 self._set(state="error", available=False, logged_in=False, account=None,
                           qr_code=None, error=error.as_dict())
                 self._report("connection_failed", error)
@@ -490,20 +380,18 @@ class WechatGateway:
 
     def _event(self, event, payload):
         if event == "scan":
-            state = str(payload.get("qr_status") or "").lower()
+            state = str(payload.get("qr_status") or "")
             current = self.status()
-            if (current.get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
-                return  # Preserve the rejection until an explicit new attempt.
             qr = payload.get('qr_code')
-            if state in {'scanned', 'confirmed', '3', '4'} and (
+            if state in {'Scanned', 'Confirmed'} and (
                     not current.get('qr_code') or qr != current['qr_code']):
-                return  # Puppet Service replays cached scan events on reconnect.
-            # Web WeChat's 408 is a long-poll timeout, not QR invalidation.
-            # The pinned puppet labels it Timeout and supplies a usable QR.
-            expired = state in {"cancel", "unknown", "1", "0"}
+                return  # Replayed scan events for an outdated QR.
+            # Waiting is the web protocol's long-poll heartbeat (408), not
+            # invalidation; only an explicit expiry clears the QR.
+            expired = state in {"Expired", "Cancel", "Unknown"}
             self._set(state="awaiting_scan", available=False, logged_in=False, account=None,
                       qr_code=None if expired else qr,
-                      qr_status=payload.get("qr_status"), qr_updated_at=_now(), error=None)
+                      qr_status=state or None, qr_updated_at=_now(), error=None)
         elif event == "login":
             self._set(state="logged_in", logged_in=True, available=False, account=payload,
                       qr_code=None, qr_status="confirmed", error=None)
@@ -512,17 +400,7 @@ class WechatGateway:
             self._set(state="logged_out", logged_in=False, available=False, account=None, qr_code=None,
                       error=WechatError("WECHAT_NOT_LOGGED_IN", "微信已退出登录。", "请重新扫码登录；新请求将优先使用可用的邮箱。", True).as_dict())
             self._report("logged_out")
-        elif event == 'login_failed':
-            code = str(payload.get('return_code', 'unknown'))
-            code = code if re.fullmatch(r'-?\d{1,8}|unknown', code) else 'unknown'
-            error = WechatError('WECHAT_LOGIN_REJECTED', '微信服务器拒绝了本次网页登录（返回码：' + code + '）。',
-                '手机扫码确认不代表登录成功。本地模式已启用 UOS 兼容登录；普通网页版的结果不能单独判断 UOS 是否可用。若刷新后仍被拒绝，请使用邮箱备用或兼容的其他 Puppet 服务。', True)
-            self._set(state='error', logged_in=False, available=False, account=None,
-                      qr_code=None, error=error.as_dict())
-            self._report('login_failed', error)
         elif event in {"error", "receive_error"}:
-            if (self.status().get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
-                return
             error = WechatError("WECHAT_RECEIVE_FAILED", "微信消息接收出现异常。", "后台将重连；请检查微信状态及记录。", True)
             self._set(available=False, error=error.as_dict())
             self._report("receive_failed", error)
@@ -566,17 +444,11 @@ class WechatGateway:
                 self._set(state="logged_in", logged_in=True, available=True, account=account,
                           qr_code=None, error=None, last_checked_at=_now())
             else:
-                if (self.status().get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
-                    self._set(last_checked_at=_now())
-                    return self.status()
                 state = "awaiting_scan" if self.status().get("qr_code") else "logged_out"
                 self._set(state=state, logged_in=False, available=False, account=None, last_checked_at=_now(),
                           error=WechatError("WECHAT_NOT_LOGGED_IN", "微信尚未登录。", "请扫描二维码并在手机上确认登录。", True).as_dict())
-        except Exception as exc:
-            if (self.status().get('error') or {}).get('code') == 'WECHAT_LOGIN_REJECTED':
-                self._set(last_checked_at=_now())
-                return self.status()
-            error = _error(exc)
+        except Exception:
+            error = _error(ConnectionError())  # never surface exception text
             self._set(state="error", available=False, logged_in=False, account=None,
                       error=error.as_dict(), last_checked_at=_now())
         return self.status()
@@ -588,59 +460,26 @@ class WechatGateway:
             raise WechatError(detail["code"], detail["message"], detail.get("hint", ""), True)
         return status
 
-    async def _avatar(self):
+    def avatar(self):
+        """Best-effort account avatar; never affects login or message routing."""
         client = self._client
         if client is None:
             return {'account_id': None, 'image': None}
-        result = await client.avatar()
-        if self._client is not client or not self.status().get('logged_in'):
-            return {'account_id': None, 'image': None}
-        return result
-
-    def avatar(self):
-        if not self.status().get('logged_in'):
-            return {'account_id': None, 'image': None}
         try:
-            return self._call(self._avatar(), 8)
+            return self._call(client.avatar(), 8)
         except Exception:
             return {'account_id': None, 'image': None}
-
-    async def _contacts(self, query, limit):
-        if self._client is None:
-            raise ConnectionError("not connected")
-        return await self._client.contacts(query, limit)
-
-    def contacts(self, query="", limit=100):
-        self._require_login()
-        try:
-            return self._call(self._contacts(str(query)[:100], max(1, min(int(limit), 100))))
-        except Exception as exc:
-            raise _error(exc) from None
-
-    async def _contact(self, contact_id):
-        if self._client is None:
-            raise ConnectionError("not connected")
-        return await self._client.contact(contact_id)
-
-    def contact(self, contact_id):
-        started = time.monotonic()
-        self._require_login()
-        try:
-            return self._call(self._contact(contact_id), max(.01, 5 - (time.monotonic() - started)))
-        except Exception as exc:
-            raise _error(exc) from None
 
     async def _send(self, record, account_id, concurrent_waiting=False):
         client = self._client
         if client is None:
             raise WechatError("WECHAT_UNAVAILABLE", "微信连接已断开。", "将尝试可用的邮箱。", True)
-        # Revalidate identity and recipient inside the same event loop as send.
-        target = record.get("target_contact_id")
+        # Revalidate identity inside the same event loop as send; the recipient
+        # is the constant filehelper conversation, so no contact lookup remains.
         async def preflight():
             current = await client.probe()
             if not current or current["id"] != account_id:
-                raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信登录账号发生变化。", "请重新选择目标联系人。", True)
-            await client.contact(target)
+                raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信登录账号发生变化。", "请重新扫码登录。", True)
         try:
             await asyncio.wait_for(preflight(), 5)
         except Exception as exc:
@@ -657,7 +496,7 @@ class WechatGateway:
             if concurrent_waiting:
                 text += "\n当前有多条消息等待回复，请使用引用回复"
         try:
-            message_id = await asyncio.wait_for(client.send(target, text), 10)
+            message_id = await asyncio.wait_for(client.send(text), 10)
         except Exception as exc:
             raise _error(exc, sending=True) from None
         return {"message_id": message_id or None}
@@ -666,9 +505,9 @@ class WechatGateway:
         status = self._require_login()
         account_id = record.get("wechat_account_id") or record.get("account_id")
         if not account_id or account_id != status["account"]["id"]:
-            raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信账号与请求绑定的账号不一致。", "请重新选择目标联系人后创建请求。", True)
-        if not record.get("target_contact_id"):
-            raise WechatError("WECHAT_CONTACT_NOT_FOUND", "尚未选择微信目标联系人。", "请在配置中选择已有联系人。", True)
+            raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信账号与请求绑定的账号不一致。", "请重新扫码登录后创建请求。", True)
+        if record.get("target_contact_id") and record["target_contact_id"] != FILEHELPER_ID:
+            raise WechatError("WECHAT_ACCOUNT_CHANGED", "请求绑定的微信对话已不存在。", "此请求创建于旧版联系人配置；请重新创建。", True)
         try:
             return self._call(self._send(record, account_id, concurrent_waiting), OPERATION_TIMEOUT)
         except (TimeoutError, concurrent.futures.TimeoutError, concurrent.futures.CancelledError) as exc:
@@ -693,7 +532,7 @@ class WechatGateway:
             current = await client.probe()
             if not current or current["id"] != account_id:
                 raise WechatError("WECHAT_ACCOUNT_CHANGED", "微信登录账号发生变化。", "状态通知未发送。", True)
-            return await client.send(contact_id, text[:MAX_TEXT])
+            return await client.send(text[:MAX_TEXT])
 
         try:
             return self._call(deliver(), OPERATION_TIMEOUT)

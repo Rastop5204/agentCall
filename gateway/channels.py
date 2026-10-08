@@ -2,11 +2,11 @@
 
 import base64
 import io
-import re
+
+from gateway.wechat import FILEHELPER_ID, FILEHELPER_NAME
 
 
-DEFAULT_WECHAT = dict(enabled=False, mode='local', service_endpoint='', service_token='',
-                      target_contact_id='', target_contact_name='', account_id='')
+DEFAULT_WECHAT = dict(enabled=False, target_contact_id='', target_contact_name='', account_id='')
 
 
 def channel_error(code, message, hint=''):
@@ -16,7 +16,7 @@ def channel_error(code, message, hint=''):
 def safe_error(exc):
     if callable(getattr(exc, 'as_dict', None)):
         return {k: v for k, v in exc.as_dict().items() if k in ('code', 'message', 'hint')}
-    return channel_error('WECHAT_ERROR', '微信服务暂时不可用。', '请检查微信登录和容器状态；自动模式会使用邮箱备用通道。')
+    return channel_error('WECHAT_ERROR', '微信服务暂时不可用。', '请检查微信登录和服务状态；自动模式会使用邮箱备用通道。')
 
 
 class Channels:
@@ -28,7 +28,19 @@ class Channels:
         self.wechat = transport
 
     def config(self):
-        return {**DEFAULT_WECHAT, **self.store.setting('wechat_config', {})}
+        stored = self.store.setting('wechat_config', {})
+        stale_binding = stored.get('target_contact_id') not in ('', FILEHELPER_ID)
+        if not set(stored) <= set(DEFAULT_WECHAT) or stale_binding:
+            # One-time upgrade migration: settings from the contact-based
+            # puppet transport (mode/endpoint/token, an old contact binding)
+            # are meaningless under the filehelper self-chat transport.
+            config = {**DEFAULT_WECHAT, **{k: v for k, v in stored.items() if k in DEFAULT_WECHAT}}
+            if stale_binding:
+                config.update(target_contact_id='', target_contact_name='', account_id='')
+            with self.store.lock:
+                self.store.set_setting('wechat_config', config)
+            return config
+        return {**DEFAULT_WECHAT, **stored}
 
     def start(self):
         if self.config()['enabled']:
@@ -48,15 +60,14 @@ class Channels:
             account = status.get('account') or {}
             if not config['target_contact_id']:
                 status['available'] = False
-                status['error'] = channel_error('WECHAT_TARGET_REQUIRED', '微信已登录，请选择目标联系人。')
+                status['error'] = channel_error('WECHAT_TARGET_REQUIRED', '微信已登录，正在绑定文件传输助手。')
             elif account.get('id') != config['account_id']:
                 status['available'] = False
-                status['error'] = channel_error('WECHAT_ACCOUNT_CHANGED', '当前微信账号已改变，请重新选择目标联系人。')
+                status['error'] = channel_error('WECHAT_ACCOUNT_CHANGED', '当前微信账号已改变，请重新扫码登录。')
         return status
 
     def view(self, probe=False):
         config = self.config()
-        config['service_token_set'] = bool(config.pop('service_token'))
         status = self.status(probe)
         status['qr_image'] = None
         qr = status.get('qr_code')
@@ -69,43 +80,49 @@ class Channels:
                 status['qr_image'] = 'data:image/svg+xml;base64,' + base64.b64encode(out.getvalue()).decode()
             except (ImportError, ValueError):
                 status['error'] = channel_error('WECHAT_QR_UNAVAILABLE', '无法生成登录二维码。', '请使用包含微信依赖的 agentCall Docker 镜像。')
+        # UI-only companion field: the account avatar shown from 待确认 until
+        # the login state is lost. Never reaches the agent-visible selection.
+        status['avatar_image'] = None
+        if status.get('logged_in') or status.get('qr_status') in ('Scanned', 'Confirmed'):
+            try:
+                avatar = self.wechat.avatar()
+                image = avatar.get('image')
+                if isinstance(image, str) and image.startswith('data:image/') and len(image) < 710000:
+                    status['avatar_image'] = image
+            except Exception:
+                pass
         return {'config': config, 'status': status}
+
+    def _auto_bind(self, account_id):
+        """Bind the filehelper conversation to the signed-in account.
+
+        Reply correlation is account-scoped and the target is a constant, so
+        binding during live requests cannot re-target an old question; this
+        deliberately bypasses the REQUESTS_ACTIVE guard used by save().
+        """
+        config = self.config()
+        config.update(target_contact_id=FILEHELPER_ID, target_contact_name=FILEHELPER_NAME,
+                      account_id=account_id)
+        with self.store.lock:
+            self.store.set_setting('wechat_config', config)
+            self.store.changed.notify_all()
+
+    def _try_auto_bind(self):
+        try:
+            live = self.wechat.check()
+        except Exception:
+            return
+        if live.get('logged_in') and (live.get('account') or {}).get('id'):
+            self._auto_bind(live['account']['id'])
 
     def save(self, data):
         from gateway.service import APIError
         old = self.config()
-        allowed = set(DEFAULT_WECHAT) - {'account_id'}
-        if set(data) - allowed - {'service_token_set'}:
+        if set(data) - {'enabled'}:
             raise APIError('INVALID_INPUT', '微信配置包含不支持的字段。')
-        config = {**old, **{k: v for k, v in data.items() if k in allowed}}
-        config['target_contact_name'] = old['target_contact_name']
-        if type(config['enabled']) is not bool or config['mode'] not in ('local', 'external'):
-            raise APIError('INVALID_INPUT', '请选择有效的微信连接模式。')
-        for field in ('service_endpoint', 'service_token', 'target_contact_id', 'target_contact_name'):
-            value = config[field]
-            if not isinstance(value, str) or len(value) > (2048 if field == 'service_token' else 254) or any(ord(c) < 32 for c in value):
-                raise APIError('INVALID_INPUT', '微信配置格式无效。')
-            config[field] = value.strip()
-        if not config['service_token']:
-            config['service_token'] = old['service_token'] if config['service_endpoint'] == old['service_endpoint'] else ''
-        if config['mode'] == 'external':
-            if not re.fullmatch(r'(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}', config['service_endpoint']):
-                raise APIError('INVALID_INPUT', '请填写微信 Puppet 服务的主机名和端口。', '例如 puppet.example.com:8788；外部服务必须支持受信任的 TLS。')
-            if not 1 <= int(config['service_endpoint'].rsplit(':', 1)[1]) <= 65535 or not config['service_token']:
-                raise APIError('INVALID_INPUT', '外部微信服务需要有效端口和服务令牌。')
-        # Selecting a target binds the choice to this signed-in account. Never
-        # authorize an arbitrary contact ID supplied by a client or reused account.
-        if config['target_contact_id'] and ('target_contact_id' in data):
-            live = self.wechat.check()
-            if not live.get('logged_in'):
-                raise APIError('WECHAT_LOGIN_REQUIRED', '请先扫码登录微信，再选择目标联系人。', status=409)
-            contact = self.wechat.contact(config['target_contact_id'])
-            if not contact:
-                raise APIError('WECHAT_CONTACT_NOT_FOUND', '目标联系人不在当前微信账号的联系人列表中。')
-            config['target_contact_name'] = contact.get('alias') or contact.get('name') or contact['id']
-            config['account_id'] = (live.get('account') or {}).get('id', '')
-        elif not config['target_contact_id']:
-            config['account_id'], config['target_contact_name'] = '', ''
+        config = {**old, **{k: v for k, v in data.items() if k in DEFAULT_WECHAT}}
+        if type(config['enabled']) is not bool:
+            raise APIError('INVALID_INPUT', '微信启用开关需要布尔值。')
         with self.store.lock:
             active = self.store.db.execute("""SELECT 1 FROM records WHERE status IN ('queued','sending')
                 OR (status='waiting' AND json_extract(data,'$.channel')='wechat') LIMIT 1""").fetchone()
@@ -113,10 +130,13 @@ class Channels:
                 raise APIError('REQUESTS_ACTIVE', '仍有正在发送或等待回复的请求。', '请等待请求结束后再修改微信配置。', 409)
             self.store.set_setting('wechat_config', config)
             self.store.changed.notify_all()
-        connection_changed = any(config[k] != old[k] for k in ('enabled', 'mode', 'service_endpoint', 'service_token'))
-        if connection_changed:
+        if config['enabled'] != old['enabled']:
             self.wechat.stop()
             self.start()
+        elif config['enabled'] and not config['account_id']:
+            # Enabled unchanged but unbound (e.g. right after the legacy
+            # migration cleared an old contact binding): bind if logged in.
+            self._try_auto_bind()
         return self.view()
 
     def login(self):
@@ -139,33 +159,17 @@ class Channels:
         self.wechat.stop()
         return self.view()
 
-    def contacts(self, query=''):
-        from gateway.service import APIError
-        if not self.config()['enabled']:
-            raise APIError('WECHAT_DISABLED', '请先启用并登录微信。', status=409)
-        try:
-            return {'items': self.wechat.contacts(query=query[:100], limit=100)}
-        except Exception as exc:
-            error = safe_error(exc)
-            raise APIError(error['code'], error['message'], error['hint'], 503) from None
-
     def check(self):
         status = self.status(probe=True)
-        error = status.get('error') or channel_error('WECHAT_OFFLINE', '微信尚未登录或连接已失效。', '请扫码登录并选择目标联系人。')
-        checks = [{'name': '微信登录与目标联系人', 'ok': bool(status.get('available')), **({} if status.get('available') else {'error': error})}]
-        if status.get('available'):
-            try:
-                if not self.wechat.contact(self.config()['target_contact_id']):
-                    raise ValueError('missing contact')
-            except Exception:
-                status['available'] = False
-                checks = [{'name': '微信目标联系人', 'ok': False, 'error': channel_error('WECHAT_CONTACT_UNAVAILABLE', '无法访问保存的微信联系人。', '请重新加载联系人并选择。')}]
+        error = status.get('error') or channel_error('WECHAT_OFFLINE', '微信尚未登录或连接已失效。', '请扫码登录文件传输助手。')
+        checks = [{'name': '微信登录与文件传输助手', 'ok': bool(status.get('available')), **({} if status.get('available') else {'error': error})}]
         record = self.store.diagnostic(checks, channel='wechat')
         return dict(ok=all(c['ok'] for c in checks), checks=checks, record_id=record['id'], status=status)
 
     def selection(self, requested='auto'):
         wx = self.status(probe=True)
-        email = bool(self.store.config())
+        config = self.store.config()
+        email = bool(config) and config.get('enabled', True)
         selected = 'wechat' if wx.get('available') else ('email' if email else None)
         reason = None
         if requested == 'email':
@@ -176,11 +180,16 @@ class Channels:
             reason = wx.get('error') or channel_error('WECHAT_OFFLINE', '微信登录或消息连接不可用，已选择邮箱备用通道。', '可以重新扫码登录微信。')
         wx.pop('qr_code', None)
         wx.pop('qr_image', None)
+        wx.pop('avatar_image', None)
         return dict(selected_channel=selected, available=bool(selected), wechat=wx,
                     email={'configured': email}, fallback_reason=reason)
 
     def on_event(self, event):
         # QR and authentication material live only in the transport's memory.
+        if isinstance(event, dict) and event.get('type') == 'logged_in':
+            account = self.wechat.status().get('account') or {}
+            if account.get('id'):
+                self._auto_bind(account['id'])
         error = event.get('error') if isinstance(event, dict) else None
         if error and error != self.store.setting('wechat_last_error'):
             self.store.diagnostic([{'name': '微信连接', 'ok': False, 'error': error}], channel='wechat')

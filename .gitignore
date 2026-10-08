@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 artifacts/
 .env
+skills/agentcall/hook-state/

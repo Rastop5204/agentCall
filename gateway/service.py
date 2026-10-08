@@ -19,7 +19,7 @@ PROVIDERS = [
 ]
 DEFAULT_CONFIG = {**{k: v for k, v in PROVIDERS[0].items() if k not in ('id', 'name', 'hint')},
                   'provider': 'icloud', 'email': '', 'username': '', 'target_email': '',
-                  'imap_folder': 'INBOX', 'poll_interval': 10}
+                  'imap_folder': 'INBOX', 'poll_interval': 10, 'enabled': True}
 FIELD_LABELS = {'subject': '邮件主题', 'body': '邮件正文', 'agent_name': 'Agent 名称',
                 'email': '发件邮箱地址', 'target_email': '目标邮箱地址', 'username': '登录用户名',
                 'smtp_host': 'SMTP 服务器地址', 'imap_host': 'IMAP 服务器地址',
@@ -80,11 +80,16 @@ class Gateway:
         from gateway.live import LiveInbox
         self.live = LiveInbox(store, self.channels)
 
+    def email_ready(self):
+        """Email participates in routing only with saved credentials AND enabled."""
+        config = self.store.config()
+        return bool(config) and config.get('enabled', True)
+
     def config_view(self):
         config = {**DEFAULT_CONFIG, **self.store.config()}
         config['password_set'] = bool(config.pop('password', ''))
         return {'config': config, 'providers': PROVIDERS, 'wechat': self.wechat_view(),
-                'service': {'configured': bool(self.store.config()) or self.channels.config()['enabled'], 'email_configured': bool(self.store.config()), 'poll_error': self.poll_error, 'last_poll_at': self.last_poll_at}}
+                'service': {'configured': bool(self.store.config()) or self.channels.config()['enabled'], 'email_configured': self.email_ready(), 'poll_error': self.poll_error, 'last_poll_at': self.last_poll_at}}
 
     def wechat_view(self, probe=False):
         return {**self.channels.view(probe), 'efficient_mode': self.live.view()}
@@ -120,6 +125,8 @@ class Gateway:
         if set(data) - fields:
             raise APIError('INVALID_INPUT', '配置包含不支持的字段。')
         config = {**DEFAULT_CONFIG, **self.store.config(), **data}
+        if type(config.get('enabled')) is not bool:
+            raise APIError('INVALID_INPUT', '邮箱启用开关需要布尔值。')
         if config['provider'] not in tuple(p['id'] for p in PROVIDERS):
             raise APIError('INVALID_INPUT', '请选择有效的邮箱服务。')
         for field in ('email', 'target_email'):
@@ -241,7 +248,7 @@ class Gateway:
                 except Exception as exc:
                     from gateway.channels import safe_error
                     error = safe_error(exc)
-                    if getattr(exc, 'safe_to_fallback', False) and record.get('requested_channel', 'auto') == 'auto' and self.store.config():
+                    if getattr(exc, 'safe_to_fallback', False) and record.get('requested_channel', 'auto') == 'auto' and self.email_ready():
                         record = self.store.set_route(record['id'], 'email', error)
                     else:
                         self.store.fail(record['id'], error)
@@ -258,7 +265,9 @@ class Gateway:
 
     def poll_once(self):
         config = self.store.config()
-        if not config:
+        if not config or not config.get('enabled', True):
+            # Disabled email keeps its credentials but stops polling IMAP;
+            # deadline expiry still runs for every channel.
             self.store.expire()
             return
         started_at = utcnow()

@@ -45,13 +45,13 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('/api/token')[0], 401)
         self.assertEqual(self.request('/api/token', headers={'Authorization': 'Bearer '+self.store.token()})[0], 403)
 
-    def test_agent_can_probe_channels_but_cannot_access_wechat_login_or_contacts(self):
+    def test_agent_can_probe_channels_but_cannot_access_wechat_login(self):
         headers = {'Authorization': 'Bearer ' + self.store.token()}
         status, _, data = self.request('/api/channels', headers=headers)
         self.assertEqual(status, 200)
         self.assertFalse(data['available'])
         self.assertNotIn('qr_code', data['wechat'])
-        for path in ('/api/wechat', '/api/wechat/contacts'):
+        for path in ('/api/wechat',):
             self.assertEqual(self.request(path, headers=headers)[0], 403)
         self.assertEqual(self.request('/api/wechat/login', 'POST', {}, headers)[0], 403)
 
@@ -93,7 +93,8 @@ class HTTPTests(unittest.TestCase):
         from gateway.store import stamp
         import time
         self.app.channels.wechat = FakeWechat()
-        self.app.save_wechat_config({'enabled': True, 'target_contact_id': 'user-1'})
+        self.app.save_wechat_config({'enabled': True})
+        self.app.channels.on_event({'type': 'logged_in'})
         _, headers, session = self.request('/api/session')
         ui = {'Cookie': headers['Set-Cookie'].split(';')[0], 'X-CSRF-Token': session['csrf_token']}
         self.assertEqual(self.request('/api/efficient-mode', 'PUT', {'enabled': True}, ui)[0], 200)
@@ -103,7 +104,7 @@ class HTTPTests(unittest.TestCase):
         listener = threading.Thread(target=lambda: result.append(self.request('/api/inbox/claim', 'POST', data, agent)))
         listener.start()
         time.sleep(.05)
-        self.app.receive_wechat({'message_id': 'http-incoming', 'from_contact_id': 'user-1',
+        self.app.receive_wechat({'message_id': 'http-incoming', 'from_contact_id': 'filehelper',
             'account_id': 'bot-1', 'body': '新指令', 'received_at': stamp()})
         listener.join(3)
         self.assertFalse(listener.is_alive())

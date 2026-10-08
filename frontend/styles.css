@@ -11,10 +11,11 @@
   --faint: #8e9a93;
   --line: #e1e8e2;
   --line-strong: #cbd7cf;
-  --accent: #287158;
-  --accent-hover: #1d5b45;
-  --accent-soft: #e6f2e9;
-  --accent-text: #1d6047;
+  --accent: #64da77;
+  --accent-hover: #4ecb64;
+  --accent-soft: #e6f8ea;
+  --accent-text: #1f7a3d;
+  --on-accent: #0e3b22;
   --dark-panel: #193c32;
   --dark-panel-text: #edf8ee;
   --warning: #946a21;
@@ -44,6 +45,7 @@
   --accent-hover: #b6e7c2;
   --accent-soft: #294934;
   --accent-text: #a9deba;
+  --on-accent: #12241a;
   --dark-panel: #2c5140;
   --dark-panel-text: #edf8ee;
   --warning: #e7c182;
@@ -213,7 +215,7 @@ button:active:not(:disabled) {
   top: -100px;
   left: 16px;
   background: var(--accent);
-  color: var(--surface);
+  color: var(--on-accent);
   padding: 10px 16px;
   z-index: 100;
 }
@@ -366,11 +368,30 @@ button:active:not(:disabled) {
   margin-top: auto;
 }
 
-.local-status {
+.local-service {
+  position: relative;
+  padding: 0 8px;
+}
+
+.local-service[open] {
+  z-index: 6;
+}
+
+.local-service summary {
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 15px 8px 20px;
+  padding: 15px 0 13px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.local-service summary::-webkit-details-marker {
+  display: none;
+}
+
+.local-service summary > div {
+  min-width: 0;
 }
 
 .status-dot {
@@ -383,21 +404,21 @@ button:active:not(:disabled) {
 }
 
 .status-dot.online {
-  background: #58a676;
-  box-shadow: 0 0 0 4px #58a67613;
+  background: #64da77;
+  box-shadow: 0 0 0 4px #64da7713;
 }
 
 .status-dot.error {
   background: var(--danger);
 }
 
-.local-status strong {
+.local-service strong {
   display: block;
   font-size: 11px;
   font-weight: 600;
 }
 
-.local-status div > span {
+.local-service summary div > span {
   display: block;
   font-size: 10px;
   color: var(--muted);
@@ -406,14 +427,73 @@ button:active:not(:disabled) {
   margin-top: 3px;
 }
 
-.local-status > [data-icon] {
+.local-service .disclosure-chevron {
   margin-left: auto;
   color: var(--faint);
+  transform: rotate(180deg);
+  transition: transform 0.2s var(--ease);
 }
 
-.local-status svg {
+.local-service[open] .disclosure-chevron {
+  transform: rotate(0deg);
+}
+
+.local-service .disclosure-chevron svg {
   width: 13px;
   height: 13px;
+}
+
+.sidebar.service-open .sidebar-note {
+  display: none;
+}
+
+.local-service-content {
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 0;
+  right: 0;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 13px 13px 14px;
+  max-height: 46vh;
+  overflow: auto;
+  z-index: 6;
+  animation: page-enter 0.2s var(--ease);
+}
+
+.local-service-content > strong {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.local-service-content code {
+  display: block;
+  font-size: 9px;
+  color: var(--text);
+  padding: 7px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow-wrap: anywhere;
+}
+
+.local-service-content p {
+  font-size: 9px;
+  color: var(--muted);
+  line-height: 1.7;
+  margin: 8px 0 11px;
+}
+
+.local-service-content .token-actions {
+  gap: 14px;
+}
+
+.local-service-content .text-button {
+  font-size: 10px;
 }
 
 .theme-toggle {
@@ -475,7 +555,7 @@ main {
   font-size: 9px;
   letter-spacing: 0.13em;
   font-weight: 650;
-  color: var(--accent);
+  color: var(--accent-text);
   display: flex;
   align-items: center;
   gap: 7px;
@@ -877,7 +957,7 @@ main {
 
 .primary {
   background: var(--accent);
-  color: var(--surface);
+  color: var(--on-accent);
 }
 
 .primary:hover:not(:disabled) {
@@ -928,6 +1008,28 @@ main {
 
 .compact-heading h2 {
   font-size: 13px;
+}
+
+.compact-heading-side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.journey-close {
+  padding: 4px;
+  color: var(--faint);
+}
+
+.journey-close:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.journey-close svg {
+  width: 13px;
+  height: 13px;
 }
 
 .compact-heading > span[data-icon] {
@@ -1188,52 +1290,6 @@ main {
 .live-test .text-button {
   margin-top: 8px;
   font-size: 10px;
-}
-
-.api-panel {
-  font-size: 10px;
-  color: var(--muted);
-  padding: 0 3px;
-}
-
-.api-panel summary {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.api-panel summary::-webkit-details-marker {
-  display: none;
-}
-
-.api-panel summary > span:last-child {
-  margin-left: auto;
-}
-
-.api-panel svg {
-  width: 13px;
-  height: 13px;
-}
-
-.api-content {
-  padding: 15px 0 3px;
-}
-
-.api-content code {
-  font-size: 10px;
-  color: var(--text);
-  padding: 8px;
-  display: block;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 5px;
-}
-
-.api-content p {
-  margin: 10px 0;
-  line-height: 1.8;
 }
 
 .token-actions {
@@ -2270,18 +2326,21 @@ dialog[open] {
   .sidebar-note > span:last-child {
     font-size: 10px;
   }
-  .local-status {
+  .local-service {
     padding-left: 4px;
     padding-right: 4px;
-    gap: 7px;
   }
-  .local-status strong {
+  .local-service summary {
+    gap: 7px;
+    padding: 13px 0 11px;
+  }
+  .local-service strong {
     font-size: 10px;
   }
-  .local-status div > span {
+  .local-service summary div > span {
     font-size: 9px;
   }
-  .local-status > [data-icon] {
+  .local-service .disclosure-chevron {
     display: none;
   }
   main {
@@ -2297,18 +2356,14 @@ dialog[open] {
     grid-template-columns: 1fr 1fr;
     gap: 18px;
   }
-  .journey-panel {
+  .skill-panel {
     order: 0;
   }
-  .skill-panel {
+  .journey-panel {
     order: 1;
   }
   .test-panel {
     order: 2;
-  }
-  .api-panel {
-    order: 3;
-    padding: 16px 5px;
   }
   .form-footer {
     padding-bottom: 5px;
@@ -2385,7 +2440,7 @@ dialog[open] {
   .nav-caption,
   .sidebar-note,
   .sidebar-footer,
-  .local-status,
+  .local-service,
   .keyboard-hint,
   .nav-arrow {
     display: none;
@@ -2658,9 +2713,6 @@ dialog[open] {
   .skill-footnote {
     justify-content: center;
   }
-  .api-panel {
-    padding: 0 4px;
-  }
   .stats-grid {
     grid-template-columns: 1fr 1fr;
   }
@@ -2766,16 +2818,25 @@ dialog[open] {
 .toggle-control input:checked + .toggle-track { background: var(--accent); }
 .toggle-control input:checked + .toggle-track:before { transform: translateX(13px); }
 .toggle-control input:focus-visible + .toggle-track { outline: 2px solid var(--accent); outline-offset: 4px; }
-.wechat-status { display: flex; align-items: flex-start; gap: 10px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); }
-.wechat-status > .status-dot { margin-top: 6px; flex: none; }
-.wechat-status strong { font-size: 12px; font-weight: 600; }
-.wechat-status p { font-size: 10px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+.wechat-steps { display: flex; align-items: flex-start; list-style: none; margin: 21px 0 2px; padding: 15px 12px 13px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); }
+.wechat-steps[hidden] { display: none; }
+.wechat-steps li { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 7px; position: relative; text-align: center; font-size: 10px; color: var(--muted); }
+.wechat-steps li:not(:first-child)::before { content: ""; position: absolute; top: 12px; right: calc(50% + 17px); left: calc(-50% + 17px); height: 1px; background: var(--line); }
+.wechat-steps li.done::before, .wechat-steps li.active::before { background: var(--accent); }
+.wechat-steps .step-index { position: relative; z-index: 1; width: 25px; height: 25px; border-radius: 50%; border: 1px solid var(--line-strong); background: var(--surface); display: grid; place-items: center; font-size: 10px; font-weight: 600; color: var(--muted); }
+.wechat-steps .step-index svg { width: 12px; height: 12px; }
+.wechat-steps li.done .step-index { border-color: var(--accent); background: var(--accent); color: #fff; }
+.wechat-steps li.active .step-index { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.wechat-steps li.active .step-label { color: var(--text); font-weight: 600; }
+.config-form.channel-disabled .provider-fieldset, .config-form.channel-disabled .advanced-settings, .config-form.channel-disabled .target-panel { opacity: 0.55; }
 .wechat-error { margin-top: 12px; }
 .wechat-login-layout { display: grid; grid-template-columns: 176px minmax(0, 1fr); gap: 23px; align-items: center; margin: 25px 0; }
 .wechat-qr { aspect-ratio: 1; border: 1px solid var(--line); border-radius: 9px; display: flex; align-items: center; justify-content: center; overflow: hidden; padding: 12px; background: var(--surface-soft); }
 .wechat-qr img { width: 100%; height: 100%; object-fit: contain; background: #fff; }
-.wechat-qr img.wechat-avatar { object-fit: cover; border-radius: 6px; background: var(--surface); }
 .qr-placeholder { display: flex; flex-direction: column; align-items: center; gap: 13px; text-align: center; color: var(--muted); font-size: 10px; }
+.wechat-qr img.wechat-avatar { width: 100px; height: 100px; box-sizing: border-box; object-fit: cover; border-radius: 10px; background: var(--surface); border: 1px solid var(--line); }
+.wechat-qr.avatar { width: 106px; height: 106px; aspect-ratio: auto; padding: 2px; }
+.wechat-login-layout.avatar { grid-template-columns: 106px minmax(0, 1fr); }
 .qr-placeholder svg { width: 48px; height: 48px; stroke-width: 1.3; color: var(--line-strong); }
 .qr-placeholder.connected svg { color: var(--accent); }
 .wechat-login-help h3 { font-size: 13px; font-weight: 600; }
@@ -2783,23 +2844,6 @@ dialog[open] {
 .wechat-login-help > .button { min-width: 125px; }
 .wechat-session-actions { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 13px; }
 .wechat-session-actions .text-button { font-size: 10px; }
-.wechat-service-help { margin-bottom: 17px; }
-.contact-toolbar { display: flex; gap: 10px; margin-bottom: 12px; }
-.contact-toolbar .search-field { flex: 1; min-width: 0; width: auto; }
-.contact-toolbar .button { padding: 9px 12px; font-size: 10px; white-space: nowrap; }
-.contact-list { max-height: 238px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); }
-.contact-empty { color: var(--muted); padding: 23px 16px; font-size: 11px; line-height: 1.8; text-align: center; }
-.contact-option { display: flex; align-items: center; gap: 10px; text-align: left; width: 100%; border: 0; border-bottom: 1px solid var(--line); padding: 11px 14px; background: transparent; }
-.contact-option:last-child { border-bottom: 0; }
-.contact-option:hover { background: var(--surface-hover); }
-.contact-option.selected { background: var(--accent-soft); }
-.contact-avatar { flex: none; width: 30px; height: 30px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: grid; place-items: center; color: var(--accent); font-size: 12px; font-weight: 600; }
-.contact-name { min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
-.contact-name small { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
-.contact-option > [data-icon] { margin-left: auto; color: var(--accent); }
-.selected-contact { display: flex; gap: 10px; align-items: center; padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: 8px; margin-bottom: 15px; }
-.selected-contact > [data-icon] { margin-left: auto; color: var(--accent); }
-.selected-contact .clear-contact { margin-left: auto; flex: none; font-size: 10px; }
 .wechat-target-panel > .field-help { margin-top: 9px; }
 .wechat-target-panel .info-line { margin-top: 17px; }
 .test-channel-field { margin-top: 17px; margin-bottom: 12px; }
@@ -2808,4 +2852,4 @@ dialog[open] {
 .fallback-box { border: 1px solid var(--line); background: var(--surface-soft); color: var(--muted); padding: 12px 14px; border-radius: 7px; font-size: 11px; line-height: 1.8; margin-bottom: 24px; }
 .fallback-box strong { color: var(--text); }
 @media (max-width: 1200px) { .wechat-panel { padding: 22px 20px; } .wechat-login-layout { grid-template-columns: 152px minmax(0, 1fr); gap: 18px; } .channel-tab { padding: 15px 13px; gap: 9px; } .channel-tab-status { font-size: 8px; } }
-@media (max-width: 480px) { .wechat-panel { padding: 21px 17px; } .wechat-panel .panel-heading { flex-wrap: wrap; } .toggle-control { margin-left: 0; width: 100%; padding-left: 38px; padding-top: 0; } .wechat-login-layout { grid-template-columns: 1fr; gap: 17px; text-align: center; } .wechat-qr { width: 176px; margin: 0 auto; } .wechat-session-actions { justify-content: center; } .channel-tab { padding: 13px 11px; gap: 8px; } .channel-tab > span:nth-child(2) { font-size: 12px; } .channel-tab > [data-icon] svg { width: 18px; height: 18px; } .channel-tab-status { display: none; } .contact-toolbar { flex-wrap: wrap; } .contact-toolbar .search-field { flex-basis: 100%; } .contact-toolbar .button { width: 100%; } .wechat-target-panel .panel-heading { margin-bottom: 20px; } .record-byline { flex-wrap: wrap; } }
+@media (max-width: 480px) { .wechat-panel { padding: 21px 17px; } .wechat-panel .panel-heading { flex-wrap: wrap; } .toggle-control { margin-left: 0; width: 100%; padding-left: 38px; padding-top: 0; } .wechat-login-layout { grid-template-columns: 1fr; gap: 17px; text-align: center; } .wechat-login-layout.avatar { grid-template-columns: 1fr; } .wechat-qr { width: 176px; margin: 0 auto; } .wechat-session-actions { justify-content: center; } .channel-tab { padding: 13px 11px; gap: 8px; } .channel-tab > span:nth-child(2) { font-size: 12px; } .channel-tab > [data-icon] svg { width: 18px; height: 18px; } .channel-tab-status { display: none; } .record-byline { flex-wrap: wrap; } }
