@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f5f7f5" />
+    <title>agentCall · 让协作保持连接</title>
+    <link rel="icon" href="/frontend/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/frontend/styles.css" />
+    <script src="/frontend/__open.js"></script>
+<script src="/frontend/app.js" type="module"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳转至主要内容</a>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <a href="#config" class="brand" aria-label="agentCall 首页"
+          ><span class="brand-mark" data-icon="signal"></span
+          ><span
+            >agentCall<span class="brand-caption"
+              >AGENT MESSAGE GATEWAY</span
+            ></span
+          ></a
+        >
+        <div class="nav-caption">工作空间</div>
+        <nav class="primary-nav">
+          <a href="#config" class="nav-item active" data-page="config"
+            ><span data-icon="sliders"></span><span>配置</span
+            ><span class="nav-arrow" data-icon="chevron-right"></span
+          ></a>
+          <a href="#records" class="nav-item" data-page="records"
+            ><span data-icon="inbox"></span><span>记录</span
+            ><span id="waiting-badge" class="nav-count" hidden>0</span></a
+          >
+        </nav>
+        <div class="sidebar-note">
+          <span class="note-orbit" data-icon="spark"></span>
+          <p>你继续生活。<br />让 Agent 保持联系。</p>
+          <span>一条消息，连接每个决策。</span>
+        </div>
+        <div class="sidebar-bottom">
+          <details class="local-service">
+            <summary>
+              <span id="service-dot" class="status-dot"></span>
+              <div>
+                <strong id="service-label">正在连接本地服务</strong
+                ><span id="service-caption">127.0.0.1 : 10086</span>
+              </div>
+              <span class="disclosure-chevron" data-icon="chevron-down"></span>
+            </summary>
+            <div class="local-service-content">
+              <strong>本机 API 与访问密钥</strong>
+              <code>http://127.0.0.1:10086</code>
+              <p>Skill 已包含访问密钥，通常无需手动配置。</p>
+              <div class="token-actions">
+                <button class="text-button" id="copy-token" type="button">
+                  <span data-icon="copy"></span>复制密钥</button
+                ><button class="text-button" id="rotate-token" type="button">
+                  <span data-icon="refresh"></span>更换密钥
+                </button>
+              </div>
+            </div>
+          </details>
+          <button class="theme-toggle" id="theme-toggle" type="button">
+            <span id="theme-icon" data-icon="moon"></span
+            ><span id="theme-label">切换深色外观</span
+            ><span class="keyboard-hint">◐</span>
+          </button>
+          <div class="sidebar-footer">
+            <span>LOCAL FIRST</span><span>v2.1</span>
+          </div>
+        </div>
+      </aside>
+      <main id="main-content" tabindex="-1">
+        <div
+          id="connection-banner"
+          class="connection-banner"
+          role="status"
+          hidden
+        >
+          <span data-icon="alert"></span><span id="connection-message"></span
+          ><button id="retry-connection" type="button">重新连接</button>
+        </div>
+        <section id="config-page" class="page" aria-labelledby="config-title">
+          <header class="page-header">
+            <div>
+              <div class="eyebrow">
+                <span class="eyebrow-line"></span> YOUR AGENT, ALWAYS IN REACH
+              </div>
+              <h1 id="config-title">
+                更像同事间的协作<span class="title-dot">.</span>
+              </h1>
+              <p>微信优先，邮箱兜底。随时随地与 Agent 沟通。</p>
+            </div>
+            <span class="local-badge"
+              ><span data-icon="shield"></span>仅在本机运行</span
+            >
+          </header>
+          <div class="config-layout">
+            <div class="config-main">
+              <div class="channel-tabs" role="tablist" aria-label="通信方式">
+                <button type="button" id="wechat-tab" class="channel-tab selected" role="tab" aria-selected="true" aria-controls="wechat-config-panel" data-channel-tab="wechat"><span data-icon="wechat"></span><span>微信<small>优先使用</small></span><span id="wechat-tab-status" class="channel-tab-status">未连接</span></button>
+                <button type="button" id="email-tab" class="channel-tab" role="tab" aria-selected="false" aria-controls="config-form" tabindex="-1" data-channel-tab="email"><span data-icon="mail"></span><span>邮箱<small>自动备用</small></span><span id="email-tab-status" class="channel-tab-status">未配置</span></button>
+              </div>
+              <p class="routing-note"><span data-icon="repeat"></span>每次发送前检查微信登录状态；微信不可用时，自动使用已保存的邮箱。</p>
+              <form id="wechat-config-panel" class="wechat-form" role="tabpanel" aria-labelledby="wechat-tab">
+                <section class="panel efficient-panel" aria-labelledby="efficient-title">
+                  <div class="panel-heading"><span class="step-number"><span data-icon="activity"></span></span><div><h2 id="efficient-title">高效模式</h2><p>把微信作为当前 Agent 会话的沟通入口。</p></div><label class="toggle-control"><input id="efficient-enabled" type="checkbox"/><span class="toggle-track" aria-hidden="true"></span><span>启用</span></label></div>
+                  <p class="field-help">开启后，Agent 的进度、问题与结果都通过微信发送。指定联系人的私聊文字随时保存，Agent 在步骤边界收取，空闲时可等待新消息；运行长工具或结束会话后不会自动唤醒。</p>
+                  <div class="efficient-footer"><div id="efficient-status" class="efficient-status" role="status" aria-live="polite">正在获取状态…</div><button id="save-efficient-mode" class="button secondary" type="button"><span data-icon="check"></span>保存模式</button></div>
+                </section>
+                <section class="panel wechat-panel" aria-labelledby="wechat-title">
+                  <div class="panel-heading">
+                    <span class="step-number"><span data-icon="wechat"></span></span>
+                    <div><h2 id="wechat-title">用微信保持联系</h2><p>扫码连接你的微信，为 Agent 指定一位联系人。</p></div>
+                    <label class="toggle-control"><input type="checkbox" id="wechat-enabled" name="wechat_enabled"/><span class="toggle-track" aria-hidden="true"></span><span>启用微信</span></label>
+                  </div>
+                  <div id="wechat-status" class="wechat-status" role="status" aria-live="polite"><span class="status-dot"></span><div><strong id="wechat-status-title">尚未连接微信</strong><p id="wechat-status-description">保存设置后，扫码登录。</p></div></div>
+                  <div id="wechat-error" class="error-box wechat-error" hidden></div>
+                  <div class="wechat-login-layout">
+                    <div id="wechat-qr" class="wechat-qr" aria-label="微信登录二维码"><div class="qr-placeholder"><span data-icon="qr"></span><span>登录二维码会显示在这里</span></div></div>
+                    <div class="wechat-login-help"><h3 id="wechat-login-title">从一次扫码开始</h3><p id="wechat-login-help">点击「扫码登录」连接微信；重新启用时会尝试恢复有效会话。更换微信账号后，请重新选择目标联系人。</p><button class="button primary" type="button" id="wechat-login"><span data-icon="qr"></span>扫码登录</button><div class="wechat-session-actions"><button class="text-button" type="button" id="wechat-refresh"><span data-icon="refresh"></span>刷新状态</button><button class="text-button" type="button" id="wechat-logout" hidden><span data-icon="logout"></span>断开并停用微信</button></div></div>
+                  </div>
+                  <details class="advanced-settings" id="wechat-advanced"><summary><span data-icon="sliders"></span>服务设置<span class="disclosure-chevron" data-icon="chevron-down"></span></summary><div class="advanced-content"><p class="field-help wechat-service-help">本机模式随 Docker 一起运行，无需服务令牌。也可连接你已有的 Wechaty 服务。</p><div class="field"><label for="wechat-mode">连接方式</label><select id="wechat-mode"><option value="local">本地服务</option><option value="external">外部服务</option></select></div><div id="wechat-external-settings" hidden><div class="field"><label for="wechat-endpoint">服务地址</label><input id="wechat-endpoint" name="wechat_endpoint" placeholder="your-wechaty-service:8788" spellcheck="false" autocomplete="off"/></div><div class="field"><label for="wechat-token">服务令牌 <span id="wechat-token-state" class="optional"></span></label><input type="password" id="wechat-token" name="wechat_token" placeholder="输入外部服务的访问令牌" autocomplete="new-password"/><p class="field-help">令牌只保存在本机，已保存的内容不会回显。</p></div></div></div></details>
+                </section>
+                <section class="panel target-panel wechat-target-panel" aria-labelledby="wechat-target-title"><div class="panel-heading"><span class="step-number">02</span><div><h2 id="wechat-target-title">消息发给谁</h2><p>选择一位已有微信联系人，通知与回复都与此人关联。</p></div><span class="heading-icon" data-icon="user"></span></div>
+                  <div id="wechat-selected-contact" class="selected-contact" hidden></div>
+                  <div class="contact-toolbar"><div class="search-field"><span data-icon="search"></span><input id="wechat-contact-search" type="search" placeholder="搜索联系人姓名或备注" aria-label="搜索微信联系人" autocomplete="off"/></div><button type="button" class="button secondary" id="wechat-load-contacts" disabled><span data-icon="refresh"></span>获取联系人</button></div>
+                  <div id="wechat-contact-bar" class="contact-list-bar" hidden><span id="wechat-contact-count">已加载 0 位联系人</span><button class="text-button" id="wechat-toggle-contacts" type="button" aria-expanded="true" aria-controls="wechat-contacts"><span data-icon="chevron-down"></span><span>收起</span></button></div>
+                  <div id="wechat-contacts" class="contact-list" role="group" aria-label="选择目标联系人"><p class="contact-empty">登录微信后，获取并选择联系人。</p></div>
+                  <p class="field-help">这里选择的是已有联系人；请先在微信中添加需要联系的人。</p>
+                  <div class="info-line"><span data-icon="shield"></span><span>仅接受所选联系人的私聊回复。群聊、其他人的消息不会作为你的决定。</span></div>
+                </section>
+                <div class="form-footer"><span id="wechat-save-status"><span data-icon="lock"></span>配置与登录会话持久保存</span><button class="button primary" id="save-wechat" type="submit"><span data-icon="check"></span>保存微信配置</button></div>
+              </form>
+              <form id="config-form" class="config-form" role="tabpanel" aria-labelledby="email-tab" hidden>
+              <section
+                class="panel account-panel"
+                aria-labelledby="account-title"
+              >
+                <div class="panel-heading">
+                  <span class="step-number">01</span>
+                  <div>
+                    <h2 id="account-title">备用发送邮箱</h2>
+                    <p>微信不可用时，通过这个邮箱发送消息与接收回复。</p>
+                  </div>
+                  <span class="heading-icon" data-icon="mail"></span>
+                </div>
+                <fieldset class="provider-fieldset">
+                  <legend>邮箱服务</legend>
+                  <div class="provider-grid" id="provider-options">
+                    <button
+                      type="button"
+                      class="provider-button selected"
+                      data-provider="icloud"
+                      aria-pressed="true"
+                    >
+                      <img
+                        class="provider-symbol provider-logo"
+                        src="/frontend/assets/providers/icloud_mail.png"
+                        width="32"
+                        height="32"
+                        alt=""
+                        draggable="false"
+                      />
+                      <span>iCloud</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="provider-button"
+                      data-provider="gmail"
+                      aria-pressed="false"
+                    >
+                      <img
+                        class="provider-symbol provider-logo"
+                        src="/frontend/assets/providers/gmail.png"
+                        width="32"
+                        height="32"
+                        alt=""
+                        draggable="false"
+                      />
+                      <span>Gmail</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="provider-button"
+                      data-provider="163"
+                      aria-pressed="false"
+                    >
+                      <img
+                        class="provider-symbol provider-logo"
+                        src="/frontend/assets/providers/netease_mail.png"
+                        width="32"
+                        height="32"
+                        alt=""
+                        draggable="false"
+                      />
+                      <span>网易邮箱</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="provider-button"
+                      data-provider="qq"
+                      aria-pressed="false"
+                    >
+                      <img
+                        class="provider-symbol provider-logo"
+                        src="/frontend/assets/providers/qq_mail.png"
+                        width="32"
+                        height="32"
+                        alt=""
+                        draggable="false"
+                      />
+                      <span>QQ 邮箱</span>
+                    </button>
+                    <button
+                      type="button"
+                      class="provider-button"
+                      data-provider="custom"
+                      aria-pressed="false"
+                    >
+                      <span class="provider-symbol" data-icon="server"></span
+                      ><span>自定义</span>
+                    </button>
+                  </div>
+                </fieldset>
+                <div class="field-grid">
+                  <div class="field">
+                    <label for="email"
+                      >发件邮箱地址 <span class="required">*</span></label
+                    ><input
+                      id="email"
+                      name="email"
+                      type="email"
+                      autocomplete="email"
+                      placeholder="agent@icloud.com"
+                      required
+                      maxlength="254"
+                    />
+                  </div>
+                  <div class="field">
+                    <label for="username"
+                      >登录用户名 <span class="optional">选填</span></label
+                    ><input
+                      id="username"
+                      name="username"
+                      autocomplete="username"
+                      placeholder="默认使用邮箱地址"
+                      maxlength="254"
+                    />
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="password"
+                    >应用专用密码 / 授权码
+                    <span id="password-state" class="optional"></span
+                  ></label>
+                  <div class="input-with-action">
+                    <input
+                      id="password"
+                      name="password"
+                      type="password"
+                      autocomplete="new-password"
+                      placeholder="输入邮箱服务提供的应用专用密码"
+                    /><button
+                      id="toggle-password"
+                      type="button"
+                      aria-label="显示密码"
+                      aria-pressed="false"
+                      data-icon="eye"
+                    ></button>
+                  </div>
+                  <p class="field-help" id="provider-help">
+                    在 Apple 账户的「登录和安全」中创建 App 专用密码。
+                  </p>
+                </div>
+                <details class="advanced-settings" id="advanced-settings">
+                  <summary>
+                    <span data-icon="sliders"></span>服务器与收件设置<span
+                      class="summary-info"
+                      id="server-summary"
+                      >已使用 iCloud 推荐设置</span
+                    ><span
+                      class="disclosure-chevron"
+                      data-icon="chevron-down"
+                    ></span>
+                  </summary>
+                  <div class="advanced-content">
+                    <div class="server-group">
+                      <h3>发信 · SMTP</h3>
+                      <div class="server-fields">
+                        <div class="field">
+                          <label for="smtp_host">服务器地址</label
+                          ><input
+                            id="smtp_host"
+                            name="smtp_host"
+                            required
+                            spellcheck="false"
+                          />
+                        </div>
+                        <div class="field">
+                          <label for="smtp_port">端口</label
+                          ><input
+                            id="smtp_port"
+                            name="smtp_port"
+                            type="number"
+                            min="1"
+                            max="65535"
+                            required
+                          />
+                        </div>
+                        <div class="field">
+                          <label for="smtp_security">加密方式</label
+                          ><select id="smtp_security" name="smtp_security">
+                            <option value="starttls">STARTTLS</option>
+                            <option value="ssl">TLS / SSL</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="server-group">
+                      <h3>收信 · IMAP</h3>
+                      <div class="server-fields">
+                        <div class="field">
+                          <label for="imap_host">服务器地址</label
+                          ><input
+                            id="imap_host"
+                            name="imap_host"
+                            required
+                            spellcheck="false"
+                          />
+                        </div>
+                        <div class="field">
+                          <label for="imap_port">端口</label
+                          ><input
+                            id="imap_port"
+                            name="imap_port"
+                            type="number"
+                            min="1"
+                            max="65535"
+                            required
+                          />
+                        </div>
+                        <div class="field">
+                          <label for="imap_security">加密方式</label
+                          ><select id="imap_security" name="imap_security">
+                            <option value="ssl">TLS / SSL</option>
+                            <option value="starttls">STARTTLS</option>
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="field-grid">
+                      <div class="field">
+                        <label for="imap_folder">收件文件夹</label
+                        ><input
+                          id="imap_folder"
+                          name="imap_folder"
+                          value="INBOX"
+                          required
+                        />
+                      </div>
+                      <div class="field">
+                        <label for="poll_interval"
+                          >检查回复间隔 <span class="optional">秒</span></label
+                        ><input
+                          id="poll_interval"
+                          name="poll_interval"
+                          type="number"
+                          min="10"
+                          max="300"
+                          value="15"
+                          required
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </details>
+              </section>
+              <section
+                class="panel target-panel"
+                aria-labelledby="target-title"
+              >
+                <div class="panel-heading">
+                  <span class="step-number">02</span>
+                  <div>
+                    <h2 id="target-title">你的收件邮箱</h2>
+                    <p>消息会发送到这里。直接回复邮件，即可回应 Agent。</p>
+                  </div>
+                  <span class="heading-icon" data-icon="user"></span>
+                </div>
+                <div class="field">
+                  <label for="target_email"
+                    >目标邮箱地址 <span class="required">*</span></label
+                  ><input
+                    id="target_email"
+                    name="target_email"
+                    type="email"
+                    autocomplete="email"
+                    placeholder="you@example.com"
+                    required
+                    maxlength="254"
+                  />
+                </div>
+                <div class="info-line">
+                  <span data-icon="info"></span
+                  ><span>仅接受来自这个邮箱的回复，让每一次回应都来自你。</span>
+                </div>
+              </section>
+              <div class="form-footer">
+                <span id="save-status"
+                  ><span data-icon="lock"></span>配置与记录保存在本机</span
+                ><button class="button primary" id="save-config" type="submit">
+                  <span data-icon="check"></span>保存配置
+                </button>
+              </div>
+            </form>
+            </div>
+            <aside class="setup-aside" aria-label="连接与测试">
+              <section class="skill-panel" aria-labelledby="skill-title">
+                <div class="skill-top">
+                  <span class="skill-icon" data-icon="terminal"></span
+                  ><span class="skill-tag">AGENT SKILL</span>
+                </div>
+                <h2 id="skill-title">让 Agent 学会联系你</h2>
+                <p>
+                  兼容 Codex、Claude Code 等支持 Skill 的
+                  Agent，附带安装脚本与调用工具。
+                </p>
+                <button
+                  class="button skill-download"
+                  id="export-skill"
+                  type="button"
+                >
+                  <span data-icon="download"></span>导出 Agent Skill<span
+                    data-icon="arrow-up-right"
+                  ></span>
+                </button>
+                <div class="skill-footnote">
+                  <span data-icon="lock"></span>包含本机访问密钥，请妥善保存
+                </div>
+              </section>
+              <section class="panel journey-panel">
+                <div class="compact-heading">
+                  <h2>连接只需三步</h2>
+                  <div class="compact-heading-side">
+                    <span class="small-label" id="setup-progress">0 / 3</span>
+                    <button
+                      class="icon-button journey-close"
+                      id="dismiss-journey"
+                      type="button"
+                      aria-label="关闭连接引导"
+                      data-icon="x"
+                    ></button>
+                  </div>
+                </div>
+                <ol class="setup-steps">
+                  <li id="step-mail">
+                    <span class="journey-marker">1</span>
+                    <div>
+                      <strong>连接通信方式</strong>
+                      <p>扫码登录微信，或保存邮箱</p>
+                    </div>
+                  </li>
+                  <li id="step-agent">
+                    <span class="journey-marker">2</span>
+                    <div>
+                      <strong>把 Skill 交给 Agent</strong>
+                      <p>安装后，消息主动到达</p>
+                    </div>
+                  </li>
+                  <li id="step-test">
+                    <span class="journey-marker">3</span>
+                    <div>
+                      <strong>发起一次对话</strong>
+                      <p>收到消息，回复，即刻连通</p>
+                    </div>
+                  </li>
+                </ol>
+                <div class="journey-bottom">
+                  <span data-icon="repeat"></span>完成任务时通知 ·
+                  需要决策时询问
+                </div>
+              </section>
+              <section class="panel test-panel" aria-labelledby="test-title">
+                <div class="compact-heading">
+                  <h2 id="test-title">检查是否一切就绪</h2>
+                  <span data-icon="activity"></span>
+                </div>
+                <p>检查连接，再发送一条需要回复的消息，确认双向通信。</p><div class="field test-channel-field"><label for="test-channel">测试方式</label><select id="test-channel"><option value="auto">自动选择 · 微信优先</option><option value="wechat">仅测试微信</option><option value="email">仅测试邮箱</option></select></div>
+                <button
+                  class="button secondary full-width"
+                  type="button"
+                  id="test-connection"
+                >
+                  <span data-icon="plug"></span>检查连接</button
+                ><button
+                  class="button subtle full-width"
+                  type="button"
+                  id="send-test"
+                >
+                  <span data-icon="send"></span>发送对话测试<span
+                    class="button-meta"
+                    >等待 5 分钟</span
+                  >
+                </button>
+                <div
+                  id="test-results"
+                  class="test-results"
+                  role="status"
+                  hidden
+                ></div>
+                <div
+                  id="live-test"
+                  class="live-test"
+                  aria-live="polite"
+                  hidden
+                ></div>
+              </section>
+            </aside>
+          </div>
+          <footer class="page-footer">
+            <span
+              ><span data-icon="shield"></span>本机服务 · 配置持久保存 ·
+              仅与指定收件人通信</span
+            ><span>agentCall / 为异步协作而生</span>
+          </footer>
+        </section>
+        <section
+          id="records-page"
+          class="page"
+          aria-labelledby="records-title"
+          hidden
+        >
+          <header class="page-header">
+            <div>
+              <div class="eyebrow">
+                <span class="eyebrow-line"></span> EVERY MESSAGE, EVERY DECISION
+              </div>
+              <h1 id="records-title">
+                每一次联系，都有迹可循<span class="title-dot">.</span>
+              </h1>
+              <p>让协作清晰可见。</p>
+            </div>
+            <button class="button secondary" id="refresh-records" type="button">
+              <span data-icon="refresh"></span>刷新记录
+            </button>
+          </header>
+          <div class="stats-grid" id="record-stats">
+            <div class="stat">
+              <span>全部记录</span><strong id="stat-total">—</strong
+              ><span class="stat-icon" data-icon="stack"></span>
+            </div>
+            <div class="stat">
+              <span>等待回复</span><strong id="stat-waiting">—</strong
+              ><span class="stat-icon" data-icon="clock"></span>
+            </div>
+            <div class="stat">
+              <span>已收到回复</span><strong id="stat-replied">—</strong
+              ><span class="stat-icon" data-icon="message"></span>
+            </div>
+            <div class="stat">
+              <span>发送 / 连接失败</span><strong id="stat-failed">—</strong
+              ><span class="stat-icon" data-icon="alert"></span>
+            </div>
+          </div>
+          <section class="panel records-panel" aria-label="消息记录">
+            <div class="records-toolbar">
+              <div class="search-field">
+                <span data-icon="search"></span
+                ><input
+                  type="search"
+                  id="record-search"
+                  aria-label="搜索记录"
+                  placeholder="搜索主题、消息或 Agent…"
+                />
+              </div>
+              <div class="record-filters">
+                <label class="sr-only" for="kind-filter">消息类型</label
+                ><select id="kind-filter">
+                  <option value="">全部类型</option>
+                  <option value="notify">仅提醒</option>
+                  <option value="ask">提醒并等待回复</option>
+                  <option value="incoming">微信收件</option>
+                  <option value="diagnostic">连接检查</option></select
+                ><label class="sr-only" for="status-filter">消息状态</label
+                ><select id="status-filter">
+                  <option value="">全部状态</option>
+                  <option value="queued">等待发送</option>
+                  <option value="sending">正在发送</option>
+                  <option value="sent">已完成</option>
+                  <option value="waiting">等待回复</option>
+                  <option value="replied">已回复</option>
+                  <option value="received">等待 Agent 读取</option>
+                  <option value="read">Agent 已读取</option>
+                  <option value="timed_out">等待超时</option>
+                  <option value="failed">失败</option>
+                </select>
+              </div>
+            </div>
+            <div class="record-table-heading" aria-hidden="true">
+              <span>消息 / 发起者</span><span>类型</span><span>状态</span
+              ><span>创建时间</span><span></span>
+            </div>
+            <div id="records-list" aria-live="polite">
+              <div class="loading-state">
+                <span class="loading-line"></span
+                ><span class="loading-line"></span
+                ><span class="loading-line"></span>
+              </div>
+            </div>
+            <div class="records-pagination">
+              <span id="record-count">正在加载记录</span>
+              <div>
+                <button
+                  class="icon-button"
+                  id="previous-page"
+                  type="button"
+                  aria-label="上一页"
+                  disabled
+                  data-icon="chevron-left"
+                ></button
+                ><span id="current-page">1</span
+                ><button
+                  class="icon-button"
+                  id="next-page"
+                  type="button"
+                  aria-label="下一页"
+                  disabled
+                  data-icon="chevron-right"
+                ></button>
+              </div>
+            </div>
+          </section>
+          <p class="records-footnote">
+            <span data-icon="info"></span
+            >请求、回复及失败原因都会保存；等待超时后的回复会单独标记。
+          </p>
+        </section>
+      </main>
+    </div>
+    <dialog
+      id="record-dialog"
+      class="record-dialog"
+      aria-labelledby="record-dialog-title"
+    >
+      <div class="dialog-header">
+        <div>
+          <span class="eyebrow">MESSAGE DETAILS</span>
+          <h2 id="record-dialog-title">消息详情</h2>
+        </div>
+        <button
+          class="icon-button"
+          type="button"
+          data-close-dialog="record-dialog"
+          aria-label="关闭消息详情"
+          data-icon="x"
+        ></button>
+      </div>
+      <div id="record-detail" class="record-detail"></div>
+    </dialog>
+    <dialog
+      id="confirm-dialog"
+      class="confirm-dialog"
+      aria-labelledby="confirm-title"
+    >
+      <span class="confirm-icon" data-icon="key"></span>
+      <h2 id="confirm-title">更换访问密钥？</h2>
+      <p>已导出的 Skill 将无法继续连接。更换后，请重新导出并安装 Skill。</p>
+      <div class="confirm-actions">
+        <button
+          class="button secondary"
+          type="button"
+          data-close-dialog="confirm-dialog"
+        >
+          取消</button
+        ><button class="button primary" type="button" id="confirm-rotate">
+          更换密钥
+        </button>
+      </div>
+    </dialog>
+    <div
+      id="toast-region"
+      class="toast-region"
+      aria-live="polite"
+      aria-atomic="false"
+    ></div>
+  </body>
+</html>
